@@ -1,4 +1,5 @@
 # Value-Investing-terminal
+![Terminal Dashboard](dashboard.png)
 Automated Python financial terminal for quantitative analysis of Special Situations and Value Investing.
  Value Investing & Special Situations Terminal
 
