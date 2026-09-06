@@ -28,3 +28,9 @@ Built around a quantitative investment framework to eliminate manual data collec
 2. Install required packages: `pip install yfinance pandas alpha_vantage plotly`
 3. Add your Alpha Vantage API key to `AV_KEY`.
 4. Run the script, enter your target ticker (e.g., `META`, `JNJ`), and view your report.
+
+   ---
+##  Contact & Professional Profile
+* **Developer:** Paul Barrera
+* **Focus:** Quantitative Finance Tools, Financial Engineering & LegalTech, Regtech 
+* **LinkedIn:** www.linkedin.com/in/paulbarrera1-25364b431
