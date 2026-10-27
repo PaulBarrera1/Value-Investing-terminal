@@ -21,7 +21,7 @@ import yfinance as yf
 #  CONFIGURACIÓN GLOBAL
 # ──────────────────────────────────────────────────────────────────
 
-AV_KEY = "Paulbarrera1"          # Alpha Vantage API Key
+AV_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")  # Alpha Vantage API Key (env var)
 AV_BASE = "https://www.alphavantage.co/query"
 AV_DELAY = 12                          # segundos entre calls (plan free: 5 req/min)
 
