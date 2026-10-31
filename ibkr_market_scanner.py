@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from urllib.parse import urlencode, urlsplit
 
 from ib_async import IB, ScannerSubscription, StartupFetch
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 import requests
@@ -1617,6 +1617,32 @@ SPECIAL_SITUATIONS_COLUMNS = [
     ("downside_if_broken", "Downside if broken"),
     ("market_cap", "Market cap"),
     ("sources", "Sources"),
+    ("date_pulled", "Date pulled"),
+]
+
+# Deals whose annualized return clears this hurdle are written to the tracking workbook.
+# The dashboard only proposes; record_tracked_deal applies the threshold.
+TRACKER_MIN_ANNUALIZED = float(os.environ.get("TRACKER_MIN_ANNUALIZED", "0.25"))
+TRACKER_FILENAME = "special_situations_tracker.xlsx"
+TRACKER_COLUMNS = [
+    ("id", "Lead ID"),
+    ("date_added", "Date added"),
+    ("date_pulled", "Date pulled"),
+    ("last_updated", "Last updated"),
+    ("status", "Status"),
+    ("ticker", "Ticker"),
+    ("company", "Company"),
+    ("situation_type", "Situation type"),
+    ("counterparty", "Counterparty"),
+    ("deal_terms", "Deal terms"),
+    ("price", "Price at pull"),
+    ("consideration_value", "Consideration value"),
+    ("gross_spread", "Gross spread"),
+    ("close_date", "Expected close"),
+    ("days", "Days to close (from pull)"),
+    ("annualized", "Annualized"),
+    ("key_dates_catalyst", "Key dates/catalyst"),
+    ("sources", "Sources"),
 ]
 
 ANALYSIS_COLUMNS = [
@@ -1636,7 +1662,8 @@ ANALYSIS_COLUMNS = [
 ]
 
 
-def build_research_leads(candidates: list[ScanCandidate]) -> list[dict]:
+def build_research_leads(candidates: list[ScanCandidate], pulled: str = "") -> list[dict]:
+    pulled = pulled or datetime.now().astimezone().date().isoformat()
     leads = []
     for candidate in candidates:
         if not candidate.headlines:
@@ -1694,6 +1721,7 @@ def build_research_leads(candidates: list[ScanCandidate]) -> list[dict]:
             "downside_if_broken": "",
             "market_cap": "",
             "sources": sources,
+            "date_pulled": pulled,
         })
         # Fields a source states verbatim (offeror, offer-period dates) replace the blank defaults.
         leads[-1].update({
@@ -1741,7 +1769,14 @@ def _json_for_html(data) -> str:
 DEAL_TOOLS_SCRIPT = r"""
 const CALC_FIELDS=[['calc_cash','Cash per share (offer currency)'],['calc_ratio','Stock ratio (acquirer shares per share)'],
   ['calc_acquirer_price','Acquirer share price (offer currency)'],['calc_cvr','CVR / contingent value (analyst estimate)'],
-  ['calc_fx','FX: 1 offer-currency unit in quote currency (blank = 1)'],['calc_days','Days to expected close']];
+  ['calc_fx','FX: 1 offer-currency unit in quote currency (blank = 1)'],['calc_close_date','Expected close date (days run from the pull date)'],
+  ['calc_days','Days to close (used only without a close date)']];
+function pullDate(row){return /^\d{4}-\d{2}-\d{2}$/.test(row.date_pulled||'')?row.date_pulled:SCAN_DATE;}
+function daysFromPull(row){
+  const close=row.calc_close_date;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(close||'')) return calcNumber(row,'calc_days');
+  return Math.round((Date.parse(close+'T00:00:00Z')-Date.parse(pullDate(row)+'T00:00:00Z'))/86400000);
+}
 function calcNumber(row,key){const raw=row[key];const value=Number(raw);return raw!==''&&raw!=null&&Number.isFinite(value)?value:null;}
 function signedPct(x){return (x>=0?'+':'')+(x*100).toFixed(1)+'%';}
 function fmtMoney(v){
@@ -1753,8 +1788,9 @@ function dealMath(row){
   const price=Number(row.price);
   if(!(price>0)) return {error:'Needs a positive target price: the scanner quote, or type one into Price.'};
   const cash=calcNumber(row,'calc_cash')||0,ratio=calcNumber(row,'calc_ratio')||0,acquirer=calcNumber(row,'calc_acquirer_price')||0;
-  const cvr=calcNumber(row,'calc_cvr')||0,fx=calcNumber(row,'calc_fx')??1,days=calcNumber(row,'calc_days');
+  const cvr=calcNumber(row,'calc_cvr')||0,fx=calcNumber(row,'calc_fx')??1,days=daysFromPull(row);
   if(fx<=0) return {error:'FX must be positive.'};
+  if(row.calc_close_date&&days<=0) return {error:'Expected close date must be after the pull date ('+pullDate(row)+').'};
   if(ratio&&!acquirer) return {error:'A stock ratio needs the acquirer share price.'};
   if(!cash&&!ratio&&!cvr) return {error:'Enter cash and/or a stock ratio with the acquirer price.'};
   const value=(cash+ratio*acquirer+cvr)*fx,spread=value/price-1;
@@ -1767,9 +1803,12 @@ function renderDealTools(id){
   if(!host||!row) return;
   host.innerHTML='<h3 style="margin-top:22px">Deal calculator</h3>'+
     '<p class="sheet-note">Enter the offer terms from the source filing. Consideration value = (cash + ratio x acquirer price + CVR estimate) x FX; '+
-    'annualized = gross spread x 365 / days (simple, as in the workbook). CVR value is your estimate, not a market price.</p>'+
+    'annualized = gross spread x 365 / days (simple, as in the workbook), with days counted from the pull date ('+escapeCell(pullDate(row))+'). '+
+    'CVR value is your estimate, not a market price. Applying a deal at or above '+(TRACKER_MIN_ANNUALIZED*100).toFixed(0)+
+    '% annualized adds it to the tracking workbook.</p>'+
     '<div class="detail-grid">'+CALC_FIELDS.map(([field,label])=>'<label class="detail-field"><span>'+escapeCell(label)+
-      '</span><input type="number" step="any" data-calc="'+field+'" value="'+escapeCell(row[field]??'')+'"></label>').join('')+'</div>'+
+      '</span><input type="'+(field==='calc_close_date'?'date" min="'+pullDate(row):'number" step="any')+'" data-calc="'+field+
+      '" value="'+escapeCell(row[field]??'')+'"></label>').join('')+'</div>'+
     '<p id="calcResult" class="sheet-note" role="status"></p>'+
     '<div class="actions"><button type="button" data-apply-calc>Apply to workbook row</button>'+
     '<button type="button" data-load-financials>Load SEC financials</button><span id="finStatus" class="small" role="status"></span></div>'+
@@ -1782,7 +1821,8 @@ function updateCalcResult(id){
   if(!out||!row) return;
   const r=dealMath(row);
   out.textContent=r.error||('Consideration '+r.value.toFixed(2)+' vs price '+Number(row.price).toFixed(2)+
-    ' -> gross spread '+signedPct(r.spread)+(r.annualized!==null?', annualized '+signedPct(r.annualized)+' over '+r.days+'d':', add days for annualized'));
+    ' -> gross spread '+signedPct(r.spread)+(r.annualized!==null?', annualized '+signedPct(r.annualized)+' over '+r.days+
+    'd from '+pullDate(row)+(r.annualized>=TRACKER_MIN_ANNUALIZED?' - clears the tracking threshold':''):', add a close date for annualized'));
 }
 function renderFinancials(f){
   const table=document.getElementById('finTable');
@@ -1827,7 +1867,25 @@ document.getElementById('selectedAnalysis').addEventListener('click',async event
       if(!analysis.value_estimate) analysis.value_estimate=r.value.toFixed(2)+' ('+r.terms+')';
     }
     saveResearch();renderResearch();
-    document.getElementById('calcResult').textContent='Applied to the workbook row and the EV analysis upside.';
+    const result=document.getElementById('calcResult');
+    result.textContent='Applied to the workbook row and the EV analysis upside.';
+    if(r.annualized===null){result.textContent+=' Add an expected close date to check it against the tracking threshold.';return;}
+    try{
+      const response=await fetch('/api/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        id,ticker:research.ticker,company:research.company,situation_type:research.situation_type,counterparty:research.counterparty,
+        deal_terms:research.deal_terms,price:research.price,consideration_value:r.value,gross_spread:r.spread,
+        close_date:research.calc_close_date||'',days:r.days,annualized:r.annualized,
+        key_dates_catalyst:research.key_dates_catalyst,sources:research.sources,date_pulled:pullDate(research)})});
+      const tracked=await response.json();
+      if(!response.ok) throw new Error(tracked.error||'Tracker update failed.');
+      const message=tracked.tracked?(tracked.updated?' Tracker row updated':' Added to the tracker')+' ('+tracked.path+').':
+        tracked.status.startsWith('Below threshold since')?' Below the threshold now; tracker row marked "'+tracked.status+'".':
+        ' Below the '+(TRACKER_MIN_ANNUALIZED*100).toFixed(0)+'% threshold, so not tracked.';
+      document.getElementById('calcResult').textContent+=message;
+    }catch(error){
+      const out=document.getElementById('calcResult');
+      out.textContent+=' Tracker not updated: '+error.message;
+    }
   }
   if(event.target.closest('[data-load-financials]')){
     const status=document.getElementById('finStatus');
@@ -1848,6 +1906,14 @@ document.getElementById('selectedAnalysis').addEventListener('click',async event
 """
 
 
+def _pulled_at(summary: dict) -> datetime:
+    """When the scan's data was pulled; falls back to now for reports built without a scan time."""
+    try:
+        return datetime.fromisoformat(summary["pulled_at"])
+    except (KeyError, TypeError, ValueError):
+        return datetime.now().astimezone()
+
+
 def build_live_report(
     candidates: list[ScanCandidate],
     warnings: list[str],
@@ -1856,7 +1922,8 @@ def build_live_report(
 ) -> str:
     """Add an on-demand scan refresh and an Excel-shaped research workspace."""
     page = build_report(candidates, warnings, summary, include_analysis_links=True)
-    leads = build_research_leads(candidates)
+    pulled_at = _pulled_at(summary)
+    leads = build_research_leads(candidates, pulled_at.date().isoformat())
     analysis = build_analysis_leads(leads)
     style = """
 <style>
@@ -1878,6 +1945,7 @@ def build_live_report(
 .detail-field input,.detail-field textarea,.detail-field output{width:100%;min-height:36px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:4px;padding:8px;font:inherit}
 .detail-field textarea{min-height:74px;resize:vertical}.detail-field output{display:block;color:#e6edf3}
 .detail-heading{display:flex;justify-content:space-between;align-items:start;gap:12px}
+.pulled-date{background:#1c2128;border:1px solid #d29922;border-radius:6px;padding:9px 13px;margin:12px 0;font-size:.85rem}.pulled-date strong{color:#d29922;font-size:1rem}
 .research-table tr.stale{opacity:.55}.research-table tr.analysis-target{outline:2px solid #58a6ff;outline-offset:-2px}.analysis-link{color:#58a6ff;text-decoration:none}.analysis-link:hover{text-decoration:underline}.sheet-note{color:#8b949e;font-size:.78rem;line-height:1.55}.update-error{color:#f85149}
 </style>"""
     page = page.replace("</head>", style + "</head>", 1)
@@ -1895,6 +1963,7 @@ def build_live_report(
         for mode, label in SOURCE_MODES.items()
     )
     controls = f"""
+<p class="pulled-date">Data pulled: <strong>{_safe(pulled_at.strftime("%a %b %d, %Y %H:%M %Z").strip())}</strong> · days to close and annualized returns run from this date · deals at or above {TRACKER_MIN_ANNUALIZED:.0%} annualized are added to <code>{_safe(TRACKER_FILENAME)}</code></p>
 <div class="actions">
   <label for="sourceMode">Scan sources</label>
   <select id="sourceMode" aria-label="Scan sources">{source_options}</select>
@@ -1936,6 +2005,8 @@ const INITIAL_ANALYSIS={_json_for_html(analysis)};
 const RESEARCH_COLUMNS={_json_for_html(SPECIAL_SITUATIONS_COLUMNS)};
 const ANALYSIS_COLUMNS={_json_for_html(ANALYSIS_COLUMNS)};
 const STORAGE_KEY='ibkr-special-situations-research-v1';
+const SCAN_DATE={_json_for_html(pulled_at.date().isoformat())};
+const TRACKER_MIN_ANNUALIZED={TRACKER_MIN_ANNUALIZED!r};
 let researchState={{research:{{}},analysis:{{}}}};
 let selectedAnalysisId='';
 try {{
@@ -2013,14 +2084,14 @@ function renderSelectedAnalysis(id) {{
   panel.innerHTML='<div class="detail-heading"><div><h2>'+escapeCell(research.ticker)+' — '+escapeCell(research.company||'Research detail')+
     '</h2><p class="sheet-note">Workbook-style detail for this filtered scanner lead. Scanner-derived headlines and quote details are identified in the fields; blank transaction and valuation fields require analyst research.</p></div>'+
     '<button type="button" data-close-analysis>Close detail</button></div>'+
-    '<h3>Special Situations</h3><div class="detail-grid">'+renderDetailFields(RESEARCH_COLUMNS,research,'research',['price'],[])+'</div>'+
+    '<h3>Special Situations</h3><div class="detail-grid">'+renderDetailFields(RESEARCH_COLUMNS,research,'research',['price'],['date_pulled'])+'</div>'+
     '<h3 style="margin-top:22px">Analysis — EV Ranked</h3><div class="detail-grid">'+
     renderDetailFields(ANALYSIS_COLUMNS,analysis,'analysis',['days','upside','downside','probability'],['rank','ev'])+'</div>'+
     '<div id="dealTools"></div>';
   renderDealTools(id);
 }}
 function renderResearch() {{
-  renderTable(document.getElementById('specialRows'),Object.values(researchState.research),RESEARCH_COLUMNS,'research',[],['price']);
+  renderTable(document.getElementById('specialRows'),Object.values(researchState.research),RESEARCH_COLUMNS,'research',['date_pulled'],['price']);
   const rows=rankAnalysis();
   renderTable(document.getElementById('analysisRows'),rows,ANALYSIS_COLUMNS,'analysis',['rank','ev'],['days','upside','downside','probability']);
   if(selectedAnalysisId) renderSelectedAnalysis(selectedAnalysisId);
@@ -2110,7 +2181,7 @@ document.getElementById('exportWorkbook').addEventListener('click',async()=> {{
     const response=await fetch('/api/export',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{research:Object.values(researchState.research),analysis:Object.values(researchState.analysis)}})}});
     if(!response.ok) {{const result=await response.json();throw new Error(result.error||'Workbook export failed.');}}
     const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');
-    link.href=url;link.download='special_situations_'+new Date().toISOString().slice(0,10)+'.xlsx';
+    link.href=url;link.download='special_situations_'+SCAN_DATE+'.xlsx';
     document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(url);
     status.textContent='Workbook exported with your saved research edits.';
   }} catch(error) {{status.textContent='Export failed: '+error.message;status.classList.add('update-error');}}
@@ -2280,7 +2351,7 @@ def build_report(
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_safe(summary.get("source_name", "Global Event-Driven Scanner"))}</title>
+<title>{_pulled_at(summary).strftime("%Y-%m-%d")} · {_safe(summary.get("source_name", "Global Event-Driven Scanner"))}</title>
 <style>
 :root{{--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;--gold:#d29922;--green:#3fb950}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px 'Segoe UI',sans-serif}}
@@ -2294,7 +2365,7 @@ main{{max-width:1180px;margin:auto;padding:28px 20px}}h1{{font-size:1.55rem;marg
 </style></head>
 <body><main>
 <h1>Global event-driven market scan</h1>
-<p class="muted">{_safe(summary.get("source_name", "Selected research sources"))} · {datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")}</p>
+<p class="muted">{_safe(summary.get("source_name", "Selected research sources"))} · Data pulled {_safe(_pulled_at(summary).strftime("%a %b %d, %Y %H:%M %Z").strip())}</p>
 <div class="banner"><strong>Coverage limitations:</strong> {_safe(coverage)} A headline match is a research lead, not a verified catalyst or investment recommendation.</div>
 <div class="stats">
 <span class="stat">Sources: {_safe(", ".join(summary.get("sources_used", [])) or "none completed")}</span>
@@ -2468,7 +2539,8 @@ def build_excel_report(
     )
 
     summary_rows = [
-        ["Run time", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")],
+        ["Data pulled", _pulled_at(summary).strftime("%Y-%m-%d %H:%M %Z")],
+        ["Workbook written", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")],
         ["Selected source mode", summary.get("source_name", summary.get("source_mode", "IBKR Gateway"))],
         ["Sources used", ", ".join(summary.get("sources_used", [])) or "none completed"],
         ["Gateway", f"{summary['host']}:{summary['port']}"],
@@ -2490,7 +2562,7 @@ def build_excel_report(
     ]
     _write_sheet(workbook.create_sheet("Run Summary"), ["Item", "Value"], summary_rows, [30, 120])
 
-    default_research = build_research_leads(candidates)
+    default_research = build_research_leads(candidates, _pulled_at(summary).date().isoformat())
     special_rows = _clean_rows(research_rows, SPECIAL_SITUATIONS_COLUMNS, default_research)
     special_values = [
         [
@@ -2505,7 +2577,7 @@ def build_excel_report(
         special_sheet,
         [label for _, label in SPECIAL_SITUATIONS_COLUMNS],
         special_values,
-        [22, 14, 30, 28, 22, 38, 13, 20, 15, 20, 55, 45, 50, 50, 55, 32, 16, 45],
+        [22, 14, 30, 28, 22, 38, 13, 20, 15, 20, 55, 45, 50, 50, 55, 32, 16, 45, 13],
     )
 
     default_analysis = build_analysis_leads(special_rows)
@@ -2563,6 +2635,73 @@ def build_excel_report(
             price_cell.number_format = "0.00"
 
     workbook.save(path)
+
+
+def tracker_path() -> Path:
+    return _report_directory() / TRACKER_FILENAME
+
+
+def record_tracked_deal(deal: dict, path=None, today: str = "") -> dict:
+    """Add or update a deal in the tracking workbook when its annualized return clears the hurdle.
+
+    One row per lead ID. A deal already tracked that falls below the hurdle stays in the workbook
+    with status "Below threshold"; a new deal below the hurdle is not added. The threshold is
+    applied here, not by the dashboard.
+    """
+    path = Path(path or tracker_path())
+    today = today or datetime.now().astimezone().date().isoformat()
+    lead_id = str(deal.get("id", "")).strip()
+    if not lead_id:
+        raise ValueError("Tracked deal needs a lead ID.")
+    annualized = _optional_number(deal.get("annualized"))
+    clears = annualized is not None and annualized >= TRACKER_MIN_ANNUALIZED
+
+    if path.exists():
+        workbook = load_workbook(path)
+        sheet = workbook.active
+    else:
+        if not clears:
+            return {"tracked": False, "status": "Below threshold", "path": str(path)}
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Tracker"
+        _write_sheet(sheet, [label for _, label in TRACKER_COLUMNS], [],
+                     [14, 12, 12, 12, 16, 11, 30, 26, 24, 38, 12, 18, 12, 13, 12, 12, 50, 50])
+
+    existing_row = next(
+        (row[0].row for row in sheet.iter_rows(min_row=2, max_col=1) if str(row[0].value) == lead_id),
+        None,
+    )
+    if existing_row is None and not clears:
+        return {"tracked": False, "status": "Below threshold", "path": str(path)}
+
+    numbers = {"price", "consideration_value", "gross_spread", "days", "annualized"}
+    values = {key: (_optional_number(deal.get(key)) if key in numbers else str(deal.get(key, ""))[:4000])
+              for key, _ in TRACKER_COLUMNS}
+    values.update({
+        "id": lead_id,
+        "last_updated": today,
+        "status": "Active" if clears else f"Below threshold since {today}",
+    })
+    row_number = existing_row or sheet.max_row + 1
+    if existing_row:
+        values["date_added"] = sheet.cell(row=row_number, column=2).value or today
+    else:
+        values["date_added"] = today
+    for column, (key, _) in enumerate(TRACKER_COLUMNS, 1):
+        cell = sheet.cell(row=row_number, column=column, value=values[key])
+        if isinstance(values[key], str):
+            cell.data_type = "s"   # keep text like "=..." from becoming a formula
+        if key in ("gross_spread", "annualized") and values[key] is not None:
+            cell.number_format = "0.0%"
+        elif key in ("price", "consideration_value") and values[key] is not None:
+            cell.number_format = "0.00"
+    sheet.auto_filter.ref = sheet.dimensions
+    try:
+        workbook.save(path)
+    except PermissionError as error:
+        raise RuntimeError(f"Close {path.name} in Excel so the tracker can be updated.") from error
+    return {"tracked": clears, "status": values["status"], "path": str(path), "updated": bool(existing_row)}
 
 
 def _scan_from_ibkr():
@@ -2705,6 +2844,7 @@ def _scan_selected_sources(source_mode: str) -> tuple[list[ScanCandidate], list[
         summary["news_provider_names"].extend(vendor_providers)
 
     candidates = merge_duplicate_candidates(candidates)
+    summary["pulled_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     summary["sources_used"] = list(dict.fromkeys(summary["sources_used"]))
     summary["news_provider_names"] = list(dict.fromkeys(summary["news_provider_names"]))
     summary["contracts_found"] = len(candidates)
@@ -2812,6 +2952,23 @@ def create_live_dashboard_server(state: dict, refresh_scan, host="127.0.0.1", po
                     self._send_json(500, {"error": str(error)})
                 finally:
                     state["refresh_lock"].release()
+                return
+
+            if self.path == "/api/track":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > 100_000:
+                        self._send_json(413, {"error": "Tracked deal must be a JSON object under 100 KB."})
+                        return
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ValueError("Tracked deal must be a JSON object.")
+                    with state.setdefault("tracker_lock", threading.Lock()):
+                        self._send_json(200, record_tracked_deal(payload, state.get("tracker_path")))
+                except (ValueError, json.JSONDecodeError) as error:
+                    self._send_json(400, {"error": str(error)})
+                except RuntimeError as error:
+                    self._send_json(409, {"error": str(error)})
                 return
 
             if self.path == "/api/financials":

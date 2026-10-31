@@ -1,6 +1,8 @@
 import unittest
 from datetime import date
 import json
+from pathlib import Path
+import tempfile
 import threading
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -294,6 +296,87 @@ class ScannerIntegrationTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=3)
+
+
+class TrackerTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.path = Path(self.folder.name) / "tracker.xlsx"
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def deal(self, annualized, **overrides):
+        return {"id": "315852", "ticker": "BHF", "company": "Brighthouse Financial", "price": "44.73",
+                "consideration_value": 70, "gross_spread": 0.565, "close_date": "2026-12-06", "days": 36,
+                "annualized": annualized, "date_pulled": "2026-10-31", "deal_terms": "=70.00 cash", **overrides}
+
+    def test_threshold_is_applied_in_code_and_rows_upsert_by_lead(self):
+        from openpyxl import load_workbook
+        from ibkr_market_scanner import record_tracked_deal
+
+        below = record_tracked_deal(self.deal(0.249), self.path, today="2026-10-31")
+        self.assertFalse(below["tracked"])
+        self.assertFalse(self.path.exists())   # nothing written for a deal that never cleared
+
+        added = record_tracked_deal(self.deal(5.73), self.path, today="2026-10-31")
+        self.assertTrue(added["tracked"])
+        self.assertFalse(added["updated"])
+        updated = record_tracked_deal(self.deal(6.10, price="44.10"), self.path, today="2026-11-02")
+        self.assertTrue(updated["updated"])
+
+        sheet = load_workbook(self.path).active
+        self.assertEqual(sheet.max_row, 2)   # one row per lead
+        row = {sheet.cell(row=1, column=c).value: sheet.cell(row=2, column=c) for c in range(1, sheet.max_column + 1)}
+        self.assertEqual(row["Date added"].value, "2026-10-31")   # first-added date kept on update
+        self.assertEqual(row["Last updated"].value, "2026-11-02")
+        self.assertEqual(row["Date pulled"].value, "2026-10-31")
+        self.assertEqual(row["Status"].value, "Active")
+        self.assertEqual(row["Annualized"].value, 6.10)
+        self.assertEqual(row["Annualized"].number_format, "0.0%")
+        self.assertEqual(row["Price at pull"].value, 44.10)
+        self.assertEqual(row["Deal terms"].data_type, "s")   # "=..." text is not stored as a formula
+
+        dropped = record_tracked_deal(self.deal(0.10), self.path, today="2026-11-05")
+        self.assertFalse(dropped["tracked"])
+        sheet = load_workbook(self.path).active
+        self.assertEqual(sheet.cell(row=2, column=5).value, "Below threshold since 2026-11-05")
+
+    def test_track_endpoint_writes_the_configured_workbook(self):
+        state = {"candidates": [], "warnings": [], "summary": {}, "updated_at": "", "source_mode": "public",
+                 "refresh_lock": threading.Lock(), "tracker_path": str(self.path)}
+        server = create_live_dashboard_server(state, lambda mode: "")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(f"http://127.0.0.1:{server.server_port}/api/track",
+                              data=json.dumps(self.deal(0.5)).encode("utf-8"),
+                              headers={"Content-Type": "application/json"}, method="POST")
+            with urlopen(request) as response:
+                result = json.load(response)
+            self.assertTrue(result["tracked"])
+            self.assertTrue(self.path.exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_pull_date_is_stamped_on_rows_and_page(self):
+        candidate = ScanCandidate(
+            contract=SimpleNamespace(conId=1, symbol="X", localSymbol="X", secType="STK",
+                                     primaryExchange="", exchange="", currency=""),
+            headlines=[{"time": "", "provider": "p", "article_id": "a", "headline": "Merger",
+                        "matches": [("M&A / merger arbitrage", ["merger"])]}],
+        )
+        self.assertEqual(build_research_leads([candidate], "2026-10-31")[0]["date_pulled"], "2026-10-31")
+        page = build_live_report([candidate], [], {
+            "host": "127.0.0.1", "port": 4001, "scans_succeeded": 0, "scans_total": 0, "scans_planned": 0,
+            "contracts_found": 1, "news_contracts_queried": 0, "news_provider_names": [], "instruments": [],
+            "locations": [], "pulled_at": "2026-10-31T03:04:16-07:00",
+        }, "now")
+        self.assertIn("Data pulled: <strong>Sat Oct 31, 2026 03:04", page)
+        self.assertIn('const SCAN_DATE="2026-10-31"', page)
+        self.assertIn("<title>2026-10-31 ·", page)
 
 
 if __name__ == "__main__":
