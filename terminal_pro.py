@@ -9,6 +9,7 @@
 import os
 import time
 import json
+import threading
 import webbrowser
 import requests
 import pandas as pd
@@ -719,7 +720,7 @@ def _tabla_html(df: pd.DataFrame, cols: list, titulo: str) -> str:
     </div>"""
 
 
-def construir_html(datos: dict) -> str:
+def construir_html(datos: dict, scanner_url: str = "") -> str:
     """Ensambla el dashboard HTML completo a partir de todos los datos."""
     ticker   = datos["ticker"]
     hist     = datos["hist"]
@@ -739,6 +740,10 @@ def construir_html(datos: dict) -> str:
     precio = hist["Close"].iloc[-1] if not hist.empty else 0
     var_pct = ((hist["Close"].iloc[-1] - hist["Close"].iloc[0]) / hist["Close"].iloc[0] * 100) if len(hist) > 1 else 0
     signo = "+" if var_pct >= 0 else ""
+    idea_defaults_json = json.dumps(
+        {"ticker": ticker, "price": round(float(precio), 2)},
+        ensure_ascii=True,
+    ).replace("</", "<\\/")
 
     mkt_cap    = info.get("marketCap", 0)
     pe         = overview.get("TrailingPE", info.get("trailingPE", "N/A"))
@@ -803,6 +808,25 @@ def construir_html(datos: dict) -> str:
     links_html = "".join(
         f'<li><a href="{url}" target="_blank">🔗 {nombre_link}</a></li>'
         for nombre_link, url in datos["transcripts_links"].items()
+    )
+    scanner_nav = (
+        '<div class="nav-item" onclick="showSection(\'scanner\')">'
+        "🌐 &nbsp;Global Event Scanner</div>"
+        if scanner_url else ""
+    )
+    scanner_section = (
+        f"""<section id="scanner" class="section scanner-section">
+    <iframe title="Live global event-driven scanner" src="{scanner_url}" loading="lazy"
+      referrerpolicy="no-referrer"></iframe>
+  </section>"""
+        if scanner_url else ""
+    )
+    idea_note = (
+        "Use the Global Event Scanner section in this terminal to discover live filing and news leads. "
+        "Verify each event and source before adding your own scenario assumptions below."
+        if scanner_url else
+        "Research workflow only — this dashboard does not scan live news, filings, or the market for catalysts. "
+        "Add a candidate after verifying its event and source."
     )
 
     # ── Earnings sorpresa ───────────────────────────────────────
@@ -890,6 +914,8 @@ header{{
 /* ── SECCIONES ── */
 .section{{ display:none; padding:24px 28px; }}
 .section.active{{ display:block; }}
+.scanner-section.active{{ padding:0; height:100%; min-height:0; flex:1; }}
+.scanner-section iframe{{ display:block; width:100%; height:calc(100vh - 12px); min-height:720px; border:0; }}
 
 /* ── MÉTRICAS ── */
 .metrics-grid{{
@@ -976,6 +1002,52 @@ tbody tr:hover{{ background:var(--panel2); }}
   font-size:.7rem; color:var(--accent);
 }}
 .desc-box.expanded::after{{ content:"▲ ver menos"; }}
+
+/* ── IDEA GENERATOR ── */
+.idea-note{{
+  background:rgba(210,153,34,.1); border:1px solid var(--yellow);
+  border-radius:8px; padding:12px 15px; color:var(--muted);
+  font-size:.78rem; line-height:1.55; margin-bottom:18px;
+}}
+.idea-grid{{ display:grid; grid-template-columns:minmax(280px, .9fr) minmax(320px, 1.1fr); gap:16px; }}
+.idea-panel{{
+  background:var(--panel); border:1px solid var(--border);
+  border-radius:10px; padding:18px; margin-bottom:16px;
+}}
+.idea-panel h3{{ color:var(--accent); font-size:.9rem; margin-bottom:14px; }}
+.idea-form{{ display:grid; grid-template-columns:1fr 1fr; gap:11px; }}
+.idea-field{{ display:flex; flex-direction:column; gap:5px; }}
+.idea-field.full{{ grid-column:1 / -1; }}
+.idea-field label{{ color:var(--muted); font-size:.72rem; }}
+.idea-field input,.idea-field select,.idea-field textarea{{
+  width:100%; background:var(--bg); color:var(--text);
+  border:1px solid var(--border); border-radius:6px; padding:9px;
+  font:inherit; font-size:.78rem;
+}}
+.idea-field textarea{{ min-height:72px; resize:vertical; }}
+.idea-button{{
+  background:var(--accent); color:#0d1117; border:0; border-radius:6px;
+  padding:10px 14px; font-weight:700; cursor:pointer;
+}}
+.idea-button:hover{{ filter:brightness(1.1); }}
+.idea-checklist{{ color:var(--muted); font-size:.78rem; line-height:1.6; }}
+.idea-checklist strong{{ color:var(--text); }}
+.idea-list{{ display:grid; gap:10px; }}
+.idea-card{{
+  background:var(--panel); border:1px solid var(--border);
+  border-radius:9px; padding:14px 16px;
+}}
+.idea-card-head{{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
+.idea-card h4{{ font-size:.9rem; }}
+.idea-card p{{ color:var(--muted); font-size:.76rem; line-height:1.55; margin-top:7px; }}
+.idea-stats{{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }}
+.idea-stat{{ background:var(--panel2); border-radius:5px; padding:5px 8px; font-size:.7rem; color:var(--muted); }}
+.idea-stat strong{{ color:var(--text); }}
+.idea-delete{{ background:none; border:1px solid var(--border); color:var(--muted); border-radius:5px; padding:5px 8px; cursor:pointer; }}
+.idea-delete:hover{{ color:var(--red); border-color:var(--red); }}
+.idea-card a{{ color:var(--accent); font-size:.75rem; }}
+.idea-error{{ color:var(--red); font-size:.78rem; margin-top:8px; }}
+@media(max-width:850px){{ .idea-grid{{ grid-template-columns:1fr; }} }}
 </style>
 </head>
 <body>
@@ -991,6 +1063,10 @@ tbody tr:hover{{ background:var(--panel2); }}
   <div class="nav-item active" onclick="showSection('dashboard')">
     🏠 &nbsp;Dashboard
   </div>
+  <div class="nav-item" onclick="showSection('ideas')">
+    💡 &nbsp;Idea Generator
+  </div>
+  {scanner_nav}
   <div class="nav-section">Estados Financieros</div>
   <div class="nav-item" onclick="showSection('income')">
     📋 &nbsp;Income Statement
@@ -1036,6 +1112,82 @@ tbody tr:hover{{ background:var(--panel2); }}
     <div class="desc-box" onclick="this.classList.toggle('expanded')">{descripcion}</div>
     <div class="chart-container"><div id="c_precio"></div></div>
   </section>
+
+  <!-- ══ SECCIÓN: EVENT-DRIVEN IDEAS ══ -->
+  <section id="ideas" class="section">
+    <p class="sec-heading">Event-Driven Special Situations Idea Generator</p>
+    <div class="idea-note">
+      {idea_note} Your ideas are stored in this browser on this device.
+      Scenario values and probabilities are your own assumptions, not forecasts or investment advice.
+    </div>
+    <div class="idea-grid">
+      <div>
+        <div class="idea-panel">
+          <h3>Event-pattern playbook</h3>
+          <div class="idea-field">
+            <label for="ideaPattern">Situation type</label>
+            <select id="ideaPattern"></select>
+          </div>
+          <div id="ideaChecklist" class="idea-checklist" style="margin-top:12px"></div>
+        </div>
+        <div class="idea-panel">
+          <h3>Add a researched candidate</h3>
+          <form id="ideaForm" class="idea-form">
+            <div class="idea-field">
+              <label for="ideaTicker">Ticker</label>
+              <input id="ideaTicker" name="ticker" required maxlength="20">
+            </div>
+            <div class="idea-field">
+              <label for="ideaCurrent">Current price ($)</label>
+              <input id="ideaCurrent" name="current" type="number" min="0.01" step="any" required>
+            </div>
+            <div class="idea-field">
+              <label for="ideaDate">Catalyst date</label>
+              <input id="ideaDate" name="date" type="date" required>
+            </div>
+            <div class="idea-field">
+              <label for="ideaProbability">Your base-case probability (%)</label>
+              <input id="ideaProbability" name="probability" type="number" min="0" max="100" step="1" value="50" required>
+            </div>
+            <div class="idea-field">
+              <label for="ideaBase">Base-case value ($)</label>
+              <input id="ideaBase" name="base" type="number" min="0.01" step="any" required>
+            </div>
+            <div class="idea-field">
+              <label for="ideaDownside">Downside-case value ($)</label>
+              <input id="ideaDownside" name="downside" type="number" min="0.01" step="any" required>
+            </div>
+            <div class="idea-field full">
+              <label for="ideaCatalyst">Catalyst and thesis</label>
+              <textarea id="ideaCatalyst" name="catalyst" maxlength="800" required placeholder="What is the event, why might the market be mispricing it, and what would invalidate the thesis?"></textarea>
+            </div>
+            <div class="idea-field">
+              <label for="ideaSourceName">Evidence / source name</label>
+              <input id="ideaSourceName" name="sourceName" maxlength="100" required placeholder="e.g. Merger agreement, 8-K">
+            </div>
+            <div class="idea-field">
+              <label for="ideaSourceUrl">Primary-source URL</label>
+              <input id="ideaSourceUrl" name="sourceUrl" type="url" required placeholder="https://...">
+            </div>
+            <div class="idea-field full">
+              <button class="idea-button" type="submit">Add candidate to ranked watchlist</button>
+              <div id="ideaError" class="idea-error" role="alert"></div>
+            </div>
+          </form>
+        </div>
+      </div>
+      <div class="idea-panel">
+        <h3>Ranked research watchlist</h3>
+        <p class="idea-checklist" style="margin-bottom:12px">
+          Rank combines your probability-weighted scenario return, downside buffer, catalyst date, and evidence completeness.
+          It is a research-priority score, not a recommendation.
+        </p>
+        <div id="ideaList" class="idea-list" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+
+  {scanner_section}
 
   <!-- ══ SECCIÓN: INCOME STATEMENT ══ -->
   <section id="income" class="section">
@@ -1126,6 +1278,59 @@ const FIGS = {{
   cfserie: {fig_cfserie_js},
 }};
 
+const IDEA_DEFAULTS = {idea_defaults_json};
+const IDEA_STORAGE_KEY = 'value-investing-terminal-ideas-v1';
+const IDEA_PATTERNS = {{
+  spinoff: {{
+    label: 'Spin-off / forced selling',
+    trigger: 'A recently separated business may be sold by holders that cannot or do not want to own the new company.',
+    evidence: 'Separation filing, Form 10, distribution date, pro forma financials, and standalone guidance.',
+    risk: 'Stranded costs, parent dependencies, leverage, weak standalone economics, or selling already reflected in price.'
+  }},
+  merger: {{
+    label: 'Merger arbitrage',
+    trigger: 'The target trades below announced deal consideration while the transaction is pending.',
+    evidence: 'Merger agreement, consideration and exchange terms, regulatory filings, financing commitments, and closing conditions.',
+    risk: 'Regulatory challenge, financing failure, vote risk, delay, or a material gap to standalone value if the deal breaks.'
+  }},
+  busted: {{
+    label: 'Busted-deal recovery',
+    trigger: 'After a transaction ends, selling or deal overhang may leave the standalone business mispriced.',
+    evidence: 'Termination notice, break-fee terms, updated guidance, debt maturities, and post-deal liquidity.',
+    risk: 'The original deal price may not represent standalone value; the deal may have exposed deeper operating problems.'
+  }},
+  restructuring: {{
+    label: 'Post-restructuring equity',
+    trigger: 'New securities after bankruptcy or recapitalization may be underfollowed and hard to value.',
+    evidence: 'Plan of reorganization, emergence filings, new cap table, exit financing, warrants, and operating plan.',
+    risk: 'Dilution, liquidity needs, execution challenges, or a capital structure that leaves little equity value.'
+  }},
+  rights: {{
+    label: 'Rights offering / recapitalization',
+    trigger: 'Complex funding terms or dilution may create a temporary discount—or signal distress.',
+    evidence: 'Offering circular, subscription/backstop terms, pro forma share count, debt terms, and use of proceeds.',
+    risk: 'Insufficient participation, worse-than-expected dilution, or proceeds failing to address solvency.'
+  }},
+  activist: {{
+    label: 'Activist / strategic review',
+    trigger: 'Governance pressure or a strategic review could prompt asset sales, a separation, or a change in capital allocation.',
+    evidence: 'Activist filings, company response, board changes, strategic-review announcement, and timeline.',
+    risk: 'No control over outcome, stakeholder resistance, execution delay, or a catalyst that never materializes.'
+  }},
+  tender: {{
+    label: 'Tender offer / buyback dislocation',
+    trigger: 'Tender mechanics or a repurchase may cause a temporary pricing mismatch.',
+    evidence: 'Offer documents, price and proration terms, eligibility, funding, expiration date, and tax treatment.',
+    risk: 'Proration, changing terms, insufficient funding, or mistaking a capital return for durable value creation.'
+  }},
+  index: {{
+    label: 'Index / mandate-driven selling',
+    trigger: 'A rules-based removal or mandate change may create selling unrelated to near-term fundamentals.',
+    evidence: 'Index provider notice, effective date, affected funds, liquidity, and evidence of underlying business value.',
+    risk: 'Flow estimates may be wrong, the event may be priced in, or the removal may reflect genuine deterioration.'
+  }}
+}};
+
 const ID_MAP = {{
   'dashboard':      [['c_precio', 'precio']],
   'income':         [['c_rev','rev'],['c_gastos','gastos'],['c_yoy','yoy']],
@@ -1133,6 +1338,7 @@ const ID_MAP = {{
   'cashflow':       [['c_wfall','wfall'],['c_cfserie','cfserie']],
   'ratios':         [['c_ratios','ratios']],
   'earnings':       [],
+  'ideas':          [],
   'transcripciones':[],
 }};
 
@@ -1152,6 +1358,171 @@ function showSection(id) {{
     }}
   }});
 }}
+
+const ideaPattern = document.getElementById('ideaPattern');
+const ideaForm = document.getElementById('ideaForm');
+const ideaList = document.getElementById('ideaList');
+const ideaError = document.getElementById('ideaError');
+let ideas = [];
+
+function escapeIdeaText(value) {{
+  return String(value).replace(/[&<>"']/g, char => ({{
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }})[char]);
+}}
+
+function validSourceUrl(value) {{
+  try {{
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  }} catch (error) {{
+    return '';
+  }}
+}}
+
+function showPatternChecklist() {{
+  const pattern = IDEA_PATTERNS[ideaPattern.value];
+  document.getElementById('ideaChecklist').innerHTML =
+    '<p><strong>Screen for:</strong> ' + escapeIdeaText(pattern.trigger) + '</p>' +
+    '<p><strong>Verify:</strong> ' + escapeIdeaText(pattern.evidence) + '</p>' +
+    '<p><strong>Failure modes:</strong> ' + escapeIdeaText(pattern.risk) + '</p>';
+}}
+
+function ideaMetrics(idea) {{
+  const upside = (idea.base / idea.current - 1) * 100;
+  const downside = (1 - idea.downside / idea.current) * 100;
+  const riskReward = downside > 0 ? upside / downside : 0;
+  const expected = (idea.probability / 100) * upside -
+    (1 - idea.probability / 100) * downside;
+  const expectedScore = Math.max(0, Math.min(100, (expected + 30) / 60 * 100));
+  const downsideScore = Math.max(0, Math.min(100, 100 - downside * 3.33));
+  const dateIsFuture = new Date(idea.date + 'T23:59:59') >= new Date();
+  const score = Math.round(expectedScore * .5 + downsideScore * .25 +
+    (validSourceUrl(idea.sourceUrl) ? 5 : 0) +
+    (dateIsFuture ? 10 : 0) + (idea.catalyst ? 10 : 0));
+  return {{upside, downside, riskReward, expected, score, dateIsFuture}};
+}}
+
+function renderIdeas() {{
+  ideas.sort((a, b) => ideaMetrics(b).score - ideaMetrics(a).score);
+  if (!ideas.length) {{
+    ideaList.innerHTML = '<p class="no-data">No candidates yet. Add a sourced event thesis to start your watchlist.</p>';
+    return;
+  }}
+  ideaList.innerHTML = ideas.map(idea => {{
+    const metrics = ideaMetrics(idea);
+    const patternName = IDEA_PATTERNS[idea.pattern].label;
+    const safeUrl = validSourceUrl(idea.sourceUrl);
+    const source = safeUrl
+      ? '<a href="' + escapeIdeaText(safeUrl) + '" target="_blank" rel="noopener noreferrer">' +
+        escapeIdeaText(idea.sourceName) + ' ↗</a>'
+      : escapeIdeaText(idea.sourceName);
+    return '<article class="idea-card">' +
+      '<div class="idea-card-head"><div><h4>' + escapeIdeaText(idea.ticker) +
+      ' · ' + escapeIdeaText(patternName) + '</h4><p>Catalyst: ' +
+      escapeIdeaText(idea.date) + (metrics.dateIsFuture ? '' : ' · date passed; re-verify') +
+      '</p></div><div><span class="idea-stat"><strong>' + metrics.score +
+      '</strong> / 100 rank</span> <button class="idea-delete" type="button" data-delete="' +
+      escapeIdeaText(idea.id) + '" aria-label="Remove ' + escapeIdeaText(idea.ticker) +
+      '">Remove</button></div></div><p>' + escapeIdeaText(idea.catalyst) + '</p>' +
+      '<div class="idea-stats"><span class="idea-stat">Expected scenario return: <strong>' +
+      metrics.expected.toFixed(1) + '%</strong></span><span class="idea-stat">Base-case upside: <strong>' +
+      metrics.upside.toFixed(1) + '%</strong></span><span class="idea-stat">Downside case: <strong>' +
+      metrics.downside.toFixed(1) + '%</strong></span><span class="idea-stat">Upside / downside: <strong>' +
+      metrics.riskReward.toFixed(2) + 'x</strong></span><span class="idea-stat">Base-case probability: <strong>' +
+      idea.probability + '%</strong></span></div><p>Evidence: ' + source + '</p></article>';
+  }}).join('');
+}}
+
+function saveIdeas() {{
+  try {{
+    localStorage.setItem(IDEA_STORAGE_KEY, JSON.stringify(ideas));
+    ideaError.textContent = '';
+  }} catch (error) {{
+    ideaError.textContent = 'Could not save this watchlist in browser storage: ' + error.message;
+  }}
+}}
+
+Object.entries(IDEA_PATTERNS).forEach(([key, pattern]) => {{
+  const option = document.createElement('option');
+  option.value = key;
+  option.textContent = pattern.label;
+  ideaPattern.appendChild(option);
+}});
+document.getElementById('ideaTicker').value = IDEA_DEFAULTS.ticker;
+document.getElementById('ideaCurrent').value = IDEA_DEFAULTS.price || '';
+ideaPattern.addEventListener('change', showPatternChecklist);
+showPatternChecklist();
+
+try {{
+  const savedIdeas = localStorage.getItem(IDEA_STORAGE_KEY);
+  if (savedIdeas) {{
+    const parsedIdeas = JSON.parse(savedIdeas);
+    if (!Array.isArray(parsedIdeas) || parsedIdeas.some(idea =>
+        !idea || !IDEA_PATTERNS[idea.pattern] || !idea.id ||
+        !Number.isFinite(idea.current) || !Number.isFinite(idea.base) ||
+        !Number.isFinite(idea.downside) || idea.downside >= idea.current ||
+        idea.base <= idea.downside || !Number.isFinite(idea.probability) ||
+        !idea.date || !idea.sourceName || !idea.catalyst)) {{
+      throw new Error('Stored watchlist contains invalid idea data.');
+    }}
+    ideas = parsedIdeas;
+  }}
+}} catch (error) {{
+  ideaError.textContent = 'Could not load the saved watchlist: ' + error.message;
+}}
+renderIdeas();
+
+ideaForm.addEventListener('submit', formEvent => {{
+  formEvent.preventDefault();
+  ideaError.textContent = '';
+  const values = new FormData(ideaForm);
+  const tickerValue = String(values.get('ticker')).trim().toUpperCase();
+  const current = Number(values.get('current'));
+  const base = Number(values.get('base'));
+  const downside = Number(values.get('downside'));
+  const probability = Number(values.get('probability'));
+  const sourceUrl = validSourceUrl(String(values.get('sourceUrl')).trim());
+  if (!sourceUrl) {{
+    ideaError.textContent = 'Enter a valid HTTP or HTTPS source URL.';
+    return;
+  }}
+  if (!tickerValue || !Number.isFinite(current) || current <= 0 ||
+      !Number.isFinite(base) || base <= 0 || !Number.isFinite(downside) ||
+      downside <= 0 || downside >= current || base <= downside ||
+      !Number.isFinite(probability) ||
+      probability < 0 || probability > 100) {{
+    ideaError.textContent = 'Enter a ticker, positive prices with downside below current and base case above downside, and probability from 0 to 100.';
+    return;
+  }}
+  ideas.push({{
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+    ticker: tickerValue,
+    pattern: ideaPattern.value,
+    current,
+    base,
+    downside,
+    probability,
+    date: String(values.get('date')),
+    catalyst: String(values.get('catalyst')).trim(),
+    sourceName: String(values.get('sourceName')).trim(),
+    sourceUrl
+  }});
+  saveIdeas();
+  renderIdeas();
+  ideaForm.reset();
+  document.getElementById('ideaTicker').value = IDEA_DEFAULTS.ticker;
+  document.getElementById('ideaCurrent').value = IDEA_DEFAULTS.price || '';
+  document.getElementById('ideaProbability').value = 50;
+}});
+
+ideaList.addEventListener('click', clickEvent => {{
+  const button = clickEvent.target.closest('[data-delete]');
+  if (!button) return;
+  ideas = ideas.filter(idea => idea.id !== button.dataset.delete);
+  saveIdeas();
+  renderIdeas();
+}});
 
 // Renderizar sección inicial
 (ID_MAP['dashboard'] || []).forEach(([divId, figKey]) => {{
@@ -1202,6 +1573,55 @@ def abrir_chrome(url: str):
     webbrowser.open(url)
 
 
+def _start_embedded_scanner() -> str:
+    dashboard_port = int(os.environ.get("IBKR_DASHBOARD_PORT", "8765"))
+    if not 1 <= dashboard_port <= 65535:
+        raise ValueError("IBKR_DASHBOARD_PORT must be between 1 and 65535.")
+    scanner_url = f"http://127.0.0.1:{dashboard_port}/"
+    try:
+        response = requests.get(scanner_url, timeout=1)
+        if response.status_code == 200 and "Global event-driven market scan" in response.text:
+            return scanner_url
+    except requests.RequestException:
+        pass
+
+    try:
+        from ibkr_market_scanner import run_live_dashboard
+    except ImportError as error:
+        raise RuntimeError(
+            f"Install the IBKR API package to start the integrated event scanner: {error}"
+        ) from error
+
+    startup_errors = []
+
+    def serve_dashboard():
+        try:
+            run_live_dashboard(open_browser=False)
+        except Exception as error:
+            startup_errors.append(error)
+
+    scanner_thread = threading.Thread(
+        target=serve_dashboard,
+        name="integrated-event-scanner",
+        daemon=False,
+    )
+    scanner_thread.start()
+    for _ in range(100):
+        if startup_errors:
+            raise RuntimeError(f"Could not start the integrated event scanner: {startup_errors[0]}")
+        if not scanner_thread.is_alive():
+            raise RuntimeError("The integrated event scanner stopped during startup.")
+        try:
+            response = requests.get(scanner_url, timeout=1)
+            if response.status_code == 200 and "Global event-driven market scan" in response.text:
+                return scanner_url
+        except requests.RequestException:
+            time.sleep(0.1)
+    raise RuntimeError(
+        f"The integrated event scanner did not respond at {scanner_url}."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 #  PUNTO DE ENTRADA
 # ──────────────────────────────────────────────────────────────────
@@ -1211,6 +1631,44 @@ def main():
     print("  📊  TERMINAL FINANCIERA PRO — Dashboard Institucional")
     print("  Fuente: Alpha Vantage (10 años) + yfinance")
     print("═" * 58)
+
+    workflow = input(
+        "\n  [1] Terminal completo (análisis de empresa + escáner global integrado)\n"
+        "  [2] Escáner IBKR independiente con dashboard y refresh manual\n"
+        "  [3] Escaneo único IBKR y exportación\n"
+        "  Elige (default 1): "
+    ).strip() or "1"
+    if workflow == "2":
+        try:
+            from ibkr_market_scanner import run_live_dashboard
+        except ImportError as error:
+            print(f"\n  ❌ Install the IBKR API package first: pip install ib_async ({error})")
+            return
+
+        try:
+            run_live_dashboard()
+        except (RuntimeError, ValueError, OSError) as error:
+            print(f"\n  ❌ {error}")
+            return
+        return
+    if workflow == "3":
+        try:
+            from ibkr_market_scanner import run_market_scan
+        except ImportError as error:
+            print(f"\n  ❌ Install the IBKR API package first: pip install ib_async ({error})")
+            return
+        try:
+            report_path = run_market_scan()
+        except (RuntimeError, ValueError) as error:
+            print(f"\n  ❌ {error}")
+            return
+        print(f"\n  ✅ Reporte de ideas guardado: {report_path.name}")
+        print(f"  📂 Ruta: {report_path}")
+        abrir_chrome(report_path.as_uri())
+        return
+    if workflow != "1":
+        print("  ❌ Opción inválida. Elige 1, 2 o 3.")
+        return
 
     ticker = input("\n  Introduce el Ticker (ej. NVDA, AAPL, MSFT): ").upper().strip()
     if not ticker:
@@ -1232,7 +1690,13 @@ def main():
 
     # Construir y guardar HTML
     print("  ⚙️  Construyendo dashboard HTML…")
-    html = construir_html(datos)
+    scanner_url = ""
+    try:
+        scanner_url = _start_embedded_scanner()
+    except (RuntimeError, ValueError, OSError) as error:
+        print(f"\n  ⚠️  El escáner global no pudo integrarse: {error}")
+        print("  El análisis de empresa continuará sin la pestaña del escáner.")
+    html = construir_html(datos, scanner_url=scanner_url)
 
     nombre_archivo = f"terminal_pro_{ticker}.html"
     with open(nombre_archivo, "w", encoding="utf-8") as fh:
@@ -1242,8 +1706,10 @@ def main():
     print(f"\n  ✅ Reporte guardado: {nombre_archivo}")
     print(f"  📂 Ruta: {ruta}")
     print("\n  Secciones disponibles en el sidebar:")
-    print("  🏠 Dashboard  📋 Income Statement  🏦 Balance Sheet")
-    print("  💧 Cash Flow  🎯 Ratios  📅 Earnings  🎙️ Transcripciones")
+    print("  🏠 Dashboard  💡 Idea Generator  🌐 Global Event Scanner")
+    print("  📋 Income Statement")
+    print("  🏦 Balance Sheet  💧 Cash Flow  🎯 Ratios")
+    print("  📅 Earnings  🎙️ Transcripciones")
 
     abrir_chrome(f"file:///{ruta}")
 
