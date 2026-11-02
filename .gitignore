@@ -1,0 +1,6 @@
+reports/
+__pycache__/
+# Generated reports written to the repository root
+terminal_pro_*.html
+event_ideas_global_*.html
+live_dashboard_test.html
