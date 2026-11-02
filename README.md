@@ -68,6 +68,19 @@ Choose **2** for the loopback-only browser dashboard. It opens even if a selecte
 
 On Windows, double-click **`Open Special Situations Dashboard.cmd`** to start the same dashboard without the menu. It starts on **Public sources** (free regulator, exchange and news feeds, which load in a few minutes); choose IBKR or All sources from the dashboard when needed, as the full IBKR scanner sweep takes over an hour. It uses the live IB Gateway port `4001` unless `IBKR_PORT` is already set. Close its window to stop the dashboard.
 
+### Finished deal sheet
+
+Double-click **`Build Deal Sheet.cmd`** (or run `py deal_sheet.py --open`) for a finished workbook, `reports\special_situations_YYYY-MM-DD.xlsx`, in the layout of the analyst sheet. It takes about 4 minutes:
+
+- Finds pending US-listed mergers and tender offers in SEC EDGAR filings from the last 270 days (`--days` changes this) and drops deals that have closed or been delisted.
+- Reads the terms from the filings: cash per share, exchange ratio and acquirer, CVRs, and the guided close or tender expiry.
+- Prices the target and acquirer (Yahoo Finance) and computes consideration value, gross spread, days to close, annualized return, and the downside back to the pre-announcement close.
+- **Special Situations** tab: tiers A (merger arb), B (merger securities with CVRs), Verify (spreads over 40%, where a misread term is likely), and the two watchlists (possible termination, negative spread).
+- **Analysis - EV Ranked** tab: probability starts at a labeled 85% default, and EV is an Excel formula that recalculates when you edit it.
+- Deals at or above `TRACKER_MIN_ANNUALIZED` (25%) are added to `reports\special_situations_tracker.xlsx`.
+
+Terms are pattern-matched from filing text, so every row links its source filing. Bull, bear and risk columns are left for the analyst, and non-US targets are not priced here.
+
 Close the terminal running option 2 to stop the local dashboard. `IBKR_DASHBOARD_PORT` optionally changes its default local web port (`8765`). Refresh is manual by design.
 
 Optional environment settings (defaults shown):
