@@ -179,6 +179,38 @@ def _keep_edgar_row(row: dict, has_ticker: bool) -> bool:
     return has_ticker or row["form"].startswith("10-12B")
 
 
+# A tender offer or going-private filing is indexed under both the bidder and the target;
+# the filing header says which one is the subject company.
+BIDDER_FORMS = {"SC TO-T", "SC TO-T/A", "SC 13E3", "SC 13E3/A"}
+SUBJECT_CIK = re.compile(r"<SUBJECT-COMPANY>\s*<COMPANY-DATA>\s*<CONFORMED-NAME>[^\n<]*\s*<CIK>(\d+)")
+
+
+def _mark_bidders(candidates: list[ScanCandidate], user_agent: str, warnings: list[str]) -> None:
+    """Relabel the bidder's copy of a shared tender-offer filing so it is not read as a target."""
+    parties: dict[str, list[tuple[ScanCandidate, dict]]] = {}
+    for candidate in candidates:
+        for item in candidate.headlines:
+            if item["provider"].split(" · ", 1)[1] in BIDDER_FORMS:
+                parties.setdefault(item["article_id"], []).append((candidate, item))
+    for accession, shared in parties.items():
+        if len(shared) < 2:
+            continue
+        cik = str(shared[0][0].contract.conId)
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession.replace('-', '')}/{accession}.hdr.sgml"
+        try:
+            match = SUBJECT_CIK.search(_http_get(url, user_agent).text)
+        except requests.RequestException as error:
+            warnings.append(f"Could not tell bidder from target on {accession}: {error}")
+            continue
+        if not match:
+            continue
+        subject = int(match.group(1))
+        for candidate, item in shared:
+            if candidate.contract.conId != subject:
+                item["provider"] += " (bidder)"
+                item["headline"] += " - filed as bidder"
+
+
 def scan_edgar_deal_forms(business_days: int = 3, today: date | None = None) -> tuple[list[ScanCandidate], list[str], dict]:
     """Tender offers, merger proxies, spin-off Form 10s, 13Ds and delistings from EDGAR's daily form index."""
     warnings = []
@@ -232,6 +264,7 @@ def scan_edgar_deal_forms(business_days: int = 3, today: date | None = None) -> 
             })
             candidate.signals.add(f"SEC filing · {row['form']}")
     candidates = list(candidates_by_cik.values())
+    _mark_bidders(candidates, user_agent, warnings)
     for candidate in candidates:
         forms = sorted({h["provider"].split(" · ", 1)[1] for h in candidate.headlines})
         candidate.research.setdefault("status_approvals", "EDGAR filings: " + ", ".join(forms))

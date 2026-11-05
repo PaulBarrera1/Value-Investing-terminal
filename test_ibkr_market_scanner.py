@@ -523,14 +523,16 @@ class MarketScannerTests(unittest.TestCase):
             ),
             description="Test issuer",
             headlines=[{
-                "headline": "Merger agreement",
+                "headline": "Definitive merger proxy",
                 "time": "2026-10-28",
-                "provider": "SEC EDGAR",
+                "provider": "SEC EDGAR · DEFM14A",
                 "article_id": "filing-1",
-                "matches": [("M&A / merger arbitrage", ["merger"])],
+                "matches": [("M&A / merger arbitrage", ["DEFM14A"])],
             }],
         )
+        profiles = SimpleNamespace(get=lambda cik: {"domicile": "United States", "exchanges": ["NYSE"]})
         with patch.object(scanner, "_scan_from_ibkr", side_effect=RuntimeError("Gateway down")), \
+             patch.object(scanner, "_sec_profiles", return_value=profiles), \
              patch.object(scanner, "scan_sec_edgar", return_value=(
                  [candidate], [], {"sources_used": ["SEC EDGAR"], "news_provider_names": ["SEC filings"]}
              )), \

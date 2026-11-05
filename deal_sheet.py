@@ -2,12 +2,14 @@
 
 Finds pending US-listed mergers and tender offers in EDGAR, reads the deal terms from the
 filings (cash per share, exchange ratio, CVRs, expected close or tender expiry), prices the
-target and acquirer, and writes a workbook in the layout of the analyst sheet:
-"Special Situations <date>" (tiered) and "Analysis - EV Ranked". Deals at or above the
-tracker hurdle (25% annualized by default) are added to special_situations_tracker.xlsx.
+target and acquirer, and applies the book's standards (standards.py): MSCI developed-market
+domicile, then a probability-weighted return over a slipped close that must clear the 25%
+annualized hurdle. The workbook has the deals that clear ("Special Situations <date>"), every
+priced deal with an editable probability ("Analysis - EV Ranked") and the rest with the reason
+each was dropped ("Screened Out"). Deals that clear go to special_situations_tracker.xlsx.
 
 Everything here is extracted by pattern from filing text, so each row links its source filing.
-Probabilities are a labeled default for the analyst to edit; EV recalculates in Excel.
+Probabilities come from a base-rate model of that text; edit them in the Analysis tab.
 
 Usage: py deal_sheet.py [--days 270] [--open]
 """
@@ -31,6 +33,7 @@ import requests
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
+import standards
 from global_event_sources import _sec_user_agent, deal_math
 from ibkr_market_scanner import _load_sec_tickers, _report_directory, record_tracked_deal, TRACKER_MIN_ANNUALIZED
 
@@ -48,12 +51,8 @@ DEAL_QUERIES = (
 TARGET_FORMS = {"DEFM14A", "PREM14A", "SC 14D9", "SC 14D9/A", "SC TO-T", "SC TO-T/A"}
 # Filed after the announcement, these mean the deal closed or the shares were delisted.
 CLOSED_FORMS = {"25-NSE", "25", "15-12B", "15-12G", "15-15D"}
-DEFAULT_PROBABILITY = 0.85
 DEFAULT_MERGER_DAYS = 180
 DEFAULT_TENDER_DAYS = 30
-# A real deal this wide is rare (financing or regulatory doubt); a misread term is more likely. Those
-# rows go to their own tier so they are checked against the source before anyone trusts them.
-VERIFY_SPREAD = 0.40
 
 MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
 CASH_RE = re.compile(
@@ -124,6 +123,12 @@ class Deal:
     terminated: bool = False
     market_cap: float | None = None
     is_acquirer: bool = False
+    flags: list[dict] = field(default_factory=list)
+    domicile: str = ""
+    exchanges: list[str] = field(default_factory=list)
+    vote_held: bool = False
+    adv_usd: float | None = None
+    market_drift: float = 1.0
 
 
 # ---------------------------------------------------------------- HTTP
@@ -160,14 +165,14 @@ def html_to_text(raw: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\xa0", " "))
 
 
-def yahoo_prices(symbol: str, announced: date | None = None) -> tuple[float | None, float | None]:
-    """(last price, close on the last trading day before the announcement) from Yahoo's chart feed."""
+def yahoo_history(symbol: str, announced: date | None = None) -> dict:
+    """Last price, close on the last trading day before the announcement and 20-day average
+    dollar volume, from Yahoo's chart feed."""
+    empty = {"last": None, "undisturbed": None, "adv_usd": None}
     if not symbol:
-        return None, None
-    params = {"range": "5d", "interval": "1d"}
-    if announced:
-        start = datetime.combine(announced - timedelta(days=10), datetime.min.time())
-        params = {"period1": int(start.timestamp()), "period2": int(time.time()), "interval": "1d"}
+        return empty
+    start = datetime.combine((announced or date.today()) - timedelta(days=40), datetime.min.time())
+    params = {"period1": int(start.timestamp()), "period2": int(time.time()), "interval": "1d"}
     try:
         response = requests.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.replace('.', '-')}",
@@ -175,15 +180,48 @@ def yahoo_prices(symbol: str, announced: date | None = None) -> tuple[float | No
         )
         result = response.json()["chart"]["result"][0]
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
-        return None, None
+        return empty
     last = result.get("meta", {}).get("regularMarketPrice")
+    quote = result.get("indicators", {}).get("quote", [{}])[0]
+    stamps = result.get("timestamp") or []
     undisturbed = None
     if announced:
-        closes = result.get("indicators", {}).get("quote", [{}])[0].get("close") or []
-        for stamp, close in zip(result.get("timestamp") or [], closes):
+        for stamp, close in zip(stamps, quote.get("close") or []):
             if close and date.fromtimestamp(stamp) < announced:
                 undisturbed = close
-    return (float(last) if last else None), (float(undisturbed) if undisturbed else None)
+    traded = [c * v for c, v in zip(quote.get("close") or [], quote.get("volume") or []) if c and v][-20:]
+    return {"last": float(last) if last else None, "undisturbed": float(undisturbed) if undisturbed else None,
+            "adv_usd": sum(traded) / len(traded) if traded else None}
+
+
+def yahoo_prices(symbol: str, announced: date | None = None) -> tuple[float | None, float | None]:
+    """(last price, close on the last trading day before the announcement)."""
+    history = yahoo_history(symbol, announced)
+    return history["last"], history["undisturbed"]
+
+
+_MARKET: dict[date, float] = {}
+_MARKET_LOCK = threading.Lock()
+
+
+def market_drift(announced: date) -> float:
+    """S&P 500 (SPY) now over its close before the announcement, so a break price moves with the market."""
+    with _MARKET_LOCK:
+        if not _MARKET:
+            start = datetime.combine(date.today() - timedelta(days=800), datetime.min.time())
+            try:
+                result = requests.get(
+                    "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
+                    params={"period1": int(start.timestamp()), "period2": int(time.time()), "interval": "1d"},
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=12,
+                ).json()["chart"]["result"][0]
+                closes = result["indicators"]["quote"][0]["close"]
+                _MARKET.update({date.fromtimestamp(t): c for t, c in zip(result["timestamp"], closes) if c})
+            except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+                _MARKET[date.min] = 0.0   # no market data: do not retry for every deal
+    before = sorted((d, c) for d, c in _MARKET.items() if d < announced and c)
+    latest = max((d for d, c in _MARKET.items() if c), default=None)
+    return _MARKET[latest] / before[-1][1] if before and latest else 1.0
 
 
 # ---------------------------------------------------------------- discovery
@@ -346,6 +384,7 @@ def read_terms(sec: Sec, deal: Deal) -> None:
             continue   # an 8-K or 425 that never says this company is being bought
         for key, value in terms.items():
             setattr(deal, key, value)
+        deal.flags = standards.risk_flags(text)
         deal.terms_source = filing.url
         deal.tender = terms["tender"] or (
             filing.form.startswith(("SC TO-T", "SC 14D9")) and bool(re.search(r"offer\s+to\s+purchase", text, re.I)))
@@ -356,9 +395,12 @@ def read_status(sec: Sec, deal: Deal, tickers_by_cik: dict) -> None:
     """Closed / terminated flags and a status line from the target's filing history."""
     announced = min(f.filed for f in deal.filings)
     try:
-        recent = sec.get(f"https://data.sec.gov/submissions/CIK{deal.cik.zfill(10)}.json").json()["filings"]["recent"]
+        submissions = sec.get(f"https://data.sec.gov/submissions/CIK{deal.cik.zfill(10)}.json").json()
+        recent = submissions["filings"]["recent"]
     except (requests.RequestException, ValueError, KeyError):
         return
+    profile = standards.profile_from_submissions(submissions)
+    deal.domicile, deal.exchanges = profile["domicile"], profile["exchanges"]
     events = []
     for form, filed, items in zip(recent["form"], recent["filingDate"], recent.get("items", [""] * len(recent["form"]))):
         if filed < announced:
@@ -370,6 +412,7 @@ def read_status(sec: Sec, deal: Deal, tickers_by_cik: dict) -> None:
             deal.terminated = True
             events.append(f"8-K 1.02 (termination?) {filed}")
         if form == "8-K" and "5.07" in items:
+            deal.vote_held = True
             events.append(f"Vote results 8-K {filed}")
         if form in ("DEFM14A", "PREM14A", "SC 14D9", "S-4", "S-4/A", "SC TO-T"):
             events.append(f"{form} {filed}")
@@ -463,14 +506,27 @@ def deal_row(deal: Deal, pulled: date) -> dict | None:
     spread = math["gross_spread"]
     annualized = spread * 365 / days
     downside = deal.undisturbed / deal.price - 1 if deal.undisturbed else None
-    if deal.terminated or spread < 0:
-        tier = "Watchlist - negative spread" if spread < 0 else "Watchlist - possible termination"
-    elif spread > VERIFY_SPREAD:
-        tier = "Verify - unusually wide spread"
-    elif deal.cvr:
-        tier = "B - merger security"
+    risk = standards.evaluate_deal(
+        price=deal.price, value=value, days_guided=days, tender=deal.tender, flags=deal.flags,
+        undisturbed=deal.undisturbed, market_drift=deal.market_drift, vote_held=deal.vote_held,
+        stock_deal=bool(deal.ratio), cvr=deal.cvr, adv_usd=deal.adv_usd, pulled=pulled)
+    in_universe, universe_basis = standards.sec_market_status({"domicile": deal.domicile, "exchanges": deal.exchanges})
+    screen_reason = ""
+    if not in_universe:
+        tier, screen_reason = "Screened out", f"Outside universe: {universe_basis}"
+    elif deal.terminated:
+        tier, screen_reason = "Screened out", "Possible termination (8-K Item 1.02 after announcement)"
+    elif any(f["key"] == "deal_off" for f in deal.flags):
+        off = next(f for f in deal.flags if f["key"] == "deal_off")
+        tier, screen_reason = "Screened out", f"Filing says the deal is off: \"{off['evidence']}\""
+    elif spread < 0:
+        tier, screen_reason = "Screened out", "Negative spread: price above the deal value"
+    elif risk["verdict"].startswith("Clears, but verify"):
+        tier = TIER_VERIFY
+    elif risk["clears_hurdle"]:
+        tier = TIER_CLEARS
     else:
-        tier = "A - merger arb"
+        tier, screen_reason = "Screened out", risk["verdict"]
     value_text = f"{value:.2f}"
     if deal.ratio:
         value_text += f" ({deal.cash:.2f} + {deal.ratio:g} x {deal.acquirer_ticker} {deal.acquirer_price:.2f})" if deal.cash \
@@ -501,21 +557,34 @@ def deal_row(deal: Deal, pulled: date) -> dict | None:
         "market_cap": deal.market_cap,
         "sources": deal.terms_source,
         "estimated_close": estimated,
+        "screen_reason": screen_reason,
+        "domicile": universe_basis,
+        "adv_usd": deal.adv_usd,
+        "risk": risk,
     }
 
 
 # ---------------------------------------------------------------- workbook
 
-TIER_ORDER = ("A - merger arb", "B - merger security", "Verify - unusually wide spread",
-              "Watchlist - possible termination", "Watchlist - negative spread")
+TIER_CLEARS = "1 - Clears risk-adjusted hurdle"
+TIER_VERIFY = "2 - Clears, but verify: market disagrees"
+TIER_ORDER = (TIER_CLEARS, TIER_VERIFY)
 SHEET_COLUMNS = ["Tier", "Ticker", "Company", "Situation type", "Counterparty", "Deal terms", "Price",
-                 "Consideration value", "Gross spread", "Annualized", "Key dates/catalyst", "Status/approvals",
-                 "Bull", "Bear", "Risks", "Downside if broken", "Market cap", "Sources"]
-SHEET_WIDTHS = [26, 9, 30, 24, 26, 30, 9, 30, 11, 11, 40, 44, 26, 26, 26, 18, 10, 60]
-ANALYSIS_COLUMNS = ["EV rank", "Ticker", "Situation type", "Why mispriced (forced flow)", "Value estimate (method)",
-                    "Catalyst + date", "Days", "Upside if right", "Downside if wrong (valuation, opinion)",
-                    "Probability (opinion)", "EV (prob-weighted)", "Annualized (arb)", "Sizing note (liquidity/borrow)"]
-ANALYSIS_WIDTHS = [8, 9, 24, 40, 30, 40, 7, 12, 16, 12, 14, 13, 30]
+                 "Consideration value", "Gross spread", "Annualized (gross)", "Model p", "Market-implied p",
+                 "Break price", "Risk-adj. annualized", "Hurdle needs p >=", "Hurdle fails if close after",
+                 "Key dates/catalyst", "Status/approvals", "Bull", "Bear", "Risks (flags in filing)",
+                 "Kill criteria", "What could make this wrong", "Model size", "Market cap", "Domicile", "Sources"]
+SHEET_WIDTHS = [24, 9, 30, 24, 26, 30, 9, 30, 11, 11, 9, 11, 10, 12, 11, 13, 40, 44, 44, 44, 44, 50, 60, 40, 10, 24, 60]
+PERCENT_COLUMNS = {9, 10, 11, 12, 14, 15}
+WRAP_COLUMNS = {6, 8, 17, 18, 19, 20, 21, 22, 23, 24}
+ANALYSIS_COLUMNS = ["EV rank", "Ticker", "Situation type", "Verdict", "Value estimate (method)", "Catalyst + date",
+                    "Days (incl. slip)", "Upside if right", "Downside if broken", "Probability (edit)",
+                    "EV (prob-weighted)", "Risk-adj. annualized", "Clears hurdle?", "Market-implied p",
+                    "Probability basis", "Sizing note (risk budget / liquidity)"]
+ANALYSIS_WIDTHS = [8, 9, 24, 34, 30, 40, 9, 12, 12, 12, 14, 14, 10, 12, 50, 50]
+SCREENED_COLUMNS = ["Ticker", "Company", "Situation type", "Reason screened out", "Gross spread",
+                    "Annualized (gross)", "Model p", "Risk-adj. annualized", "Domicile", "Sources"]
+SCREENED_WIDTHS = [9, 30, 24, 60, 11, 11, 9, 12, 40, 60]
 HEADER_FILL = PatternFill("solid", fgColor="1F3864")
 SECTION_FILL = PatternFill("solid", fgColor="D9E1F2")
 
@@ -536,20 +605,38 @@ def _header(ws, row: int, labels: list[str], widths: list[int]):
     ws.freeze_panes = ws.cell(row=row + 1, column=3)
 
 
+def sizing_note(risk: dict) -> str:
+    note = (f"${risk['model_size'] / 1e6:,.0f}M ({risk['model_size'] / standards.NAV_USD:.1%} NAV): "
+            f"{standards.BREAK_LOSS_BUDGET:.0%} NAV break-loss budget allows ${risk['size_risk_budget'] / 1e6:,.0f}M")
+    if risk["capacity"]:
+        note += (f"; {standards.BUILD_DAYS} days at {standards.ADV_PARTICIPATION:.0%} of volume buys "
+                 f"${risk['capacity'] / 1e6:,.0f}M")
+    else:
+        note += "; volume unknown"
+    return note
+
+
+def _flags_text(risk: dict) -> str:
+    return "; ".join(f"{f['label']} - \"{f['evidence']}\"" for f in risk["flags"]) or "None found in the terms document"
+
+
 def write_workbook(rows: list[dict], pulled: datetime, path: Path, notes: list[str]) -> Path:
+    hurdle = standards.HURDLE
     workbook = Workbook()
     ws = workbook.active
     ws.title = f"Special Situations {pulled:%Y-%m-%d}"[:31]
-    ws["A1"] = f"Event-Driven Special Situations - {pulled:%a %b %d, %Y} (prices pulled {pulled:%H:%M %Z})"
+    ws["A1"] = (f"Event-Driven Special Situations - {pulled:%a %b %d, %Y} (prices pulled {pulled:%H:%M %Z}): "
+                f"deals clearing {hurdle:.0%} risk-adjusted annualized")
     ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"] = ("Research only - not investment advice. Terms extracted automatically from SEC EDGAR filings "
-                "(linked in Sources; verify before acting); prices from Yahoo Finance at pull time. "
-                "Annualized = gross spread x 365 / days to close. Bull/Bear/Risks are left for the analyst.")
+    ws["A2"] = ("Research only - not investment advice. Standards: MSCI developed-market domicile; signed deal priced "
+                "from SEC filings; probability-weighted return (model p x spread + (1 - p) x break loss) annualized over "
+                "the guided close plus a slip for each regulator must clear the hurdle. Terms, flags and probabilities are "
+                "extracted by pattern - verify against Sources before acting.")
     ws["A2"].alignment = Alignment(wrap_text=False)
     _header(ws, 4, SHEET_COLUMNS, SHEET_WIDTHS)
     r = 5
     for tier in TIER_ORDER:
-        tier_rows = sorted((x for x in rows if x["tier"] == tier), key=lambda x: -x["annualized"])
+        tier_rows = sorted((x for x in rows if x["tier"] == tier), key=lambda x: -x["risk"]["risk_adjusted_annualized"])
         if not tier_rows:
             continue
         for column in range(1, len(SHEET_COLUMNS) + 1):
@@ -557,50 +644,80 @@ def write_workbook(rows: list[dict], pulled: datetime, path: Path, notes: list[s
         ws.cell(row=r, column=1, value=f"{tier} ({len(tier_rows)})").font = Font(bold=True)
         r += 1
         for x in tier_rows:
+            risk = x["risk"]
             values = [tier, x["ticker"], x["company"], x["situation_type"], x["counterparty"], x["deal_terms"],
                       x["price"], x["consideration_text"], x["gross_spread"], x["annualized"],
-                      x["key_dates_catalyst"], x["status"], "", "", "",
-                      (f"{x['downside']:+.1%} to pre-deal {x['undisturbed']:.2f}" if x["downside"] is not None else ""),
-                      _fmt_cap(x["market_cap"]), x["sources"]]
+                      risk["probability"], risk["market_probability"], round(risk["break_price"], 2),
+                      risk["risk_adjusted_annualized"], risk["probability_needed"], risk["latest_close"],
+                      x["key_dates_catalyst"] + f"; model assumes {risk['days_expected']}d incl. {risk['slip_days']}d slip",
+                      x["status"], risk["bull"], risk["bear"], _flags_text(risk),
+                      "\n".join(f"- {k}" for k in risk["kill_criteria"]),
+                      "\n".join(f"- {w}" for w in risk["what_could_be_wrong"]),
+                      sizing_note(risk), _fmt_cap(x["market_cap"]), x["domicile"], x["sources"]]
             for column, value in enumerate(values, 1):
                 cell = ws.cell(row=r, column=column, value=value)
-                cell.alignment = Alignment(vertical="top", wrap_text=column in (6, 8, 11, 12))
-                if column in (9, 10):
-                    cell.number_format = "+0.0%;-0.0%"
-                elif column == 7:
+                cell.alignment = Alignment(vertical="top", wrap_text=column in WRAP_COLUMNS)
+                if column in PERCENT_COLUMNS:
+                    cell.number_format = "+0.0%;-0.0%" if column in (9, 10, 14) else "0%"
+                elif column in (7, 13):
                     cell.number_format = "0.00"
-                elif column == 18 and value:
+                elif column == 27 and value:
                     cell.hyperlink = value
                     cell.font = Font(color="0563C1", underline="single")
             r += 1
+    if r == 5:
+        ws.cell(row=r, column=1, value=f"No priced deal clears {hurdle:.0%} risk-adjusted today; "
+                                       "see Analysis - EV Ranked for the nearest misses.").font = Font(italic=True)
+        r += 1
     r += 1
     for note in notes:
         ws.cell(row=r, column=1, value=note).font = Font(italic=True, color="666666")
         r += 1
 
     an = workbook.create_sheet("Analysis - EV Ranked")
-    an["A1"] = "Analysis tab - ideas ranked by probability-weighted expected value (EV)."
+    an["A1"] = "Analysis tab - every priced deal in the universe, ranked by risk-adjusted annualized return."
     an["A1"].font = Font(bold=True, size=13)
-    an["A2"] = (f"EV = p x upside + (1 - p) x downside. Probability starts at a {DEFAULT_PROBABILITY:.0%} default - "
-                "edit column J and EV recalculates. Downside = move back to the pre-announcement close (opinion proxy).")
+    an["A2"] = (f"EV = p x upside + (1 - p) x downside; risk-adj. annualized = EV x 365 / days. Probability starts at the "
+                f"model estimate (basis in column O) - overwrite column J and both recalculate against the {hurdle:.0%} hurdle. "
+                "Downside = break price (pre-deal price moved with the S&P 500, less 10%).")
     _header(an, 4, ANALYSIS_COLUMNS, ANALYSIS_WIDTHS)
-    ranked = sorted((x for x in rows if x["tier"] in TIER_ORDER[:3]),
-                    key=lambda x: -(DEFAULT_PROBABILITY * x["gross_spread"]
-                                    + (1 - DEFAULT_PROBABILITY) * (x["downside"] if x["downside"] is not None else -0.25)))
+    ranked = sorted((x for x in rows if x["tier"] in TIER_ORDER or x["screen_reason"].startswith("Below hurdle")),
+                    key=lambda x: -x["risk"]["risk_adjusted_annualized"])
     for i, x in enumerate(ranked, 1):
-        row = 4 + i
-        downside = x["downside"] if x["downside"] is not None else -0.25
-        values = [i, x["ticker"], x["situation_type"], "", f"{x['consideration_value']:.2f} deal value ({x['deal_terms']})",
-                  x["key_dates_catalyst"], x["days"], x["gross_spread"], downside, DEFAULT_PROBABILITY,
-                  f"=J{row}*H{row}+(1-J{row})*I{row}", x["annualized"], _fmt_cap(x["market_cap"])]
+        row, risk = 4 + i, x["risk"]
+        values = [i, x["ticker"], x["situation_type"], risk["verdict"],
+                  f"{x['consideration_value']:.2f} deal value ({x['deal_terms']})", x["key_dates_catalyst"],
+                  risk["days_expected"], risk["gross_spread"], risk["break_loss"], round(risk["probability"], 2),
+                  f"=J{row}*H{row}+(1-J{row})*I{row}", f"=K{row}*365/G{row}", f'=IF(L{row}>={hurdle},"Yes","No")',
+                  risk["market_probability"], risk["probability_basis"], sizing_note(risk)]
         for column, value in enumerate(values, 1):
             cell = an.cell(row=row, column=column, value=value)
-            cell.alignment = Alignment(vertical="top", wrap_text=column in (5, 6))
+            cell.alignment = Alignment(vertical="top", wrap_text=column in (4, 5, 6, 15, 16))
             if column in (8, 9, 11, 12):
                 cell.number_format = "+0.0%;-0.0%"
-            elif column == 10:
+            elif column in (10, 14):
                 cell.number_format = "0%"
-    an.auto_filter.ref = f"A4:M{max(5, 4 + len(ranked))}"
+    an.auto_filter.ref = f"A4:P{max(5, 4 + len(ranked))}"
+
+    out = workbook.create_sheet("Screened Out")
+    out["A1"] = "Priced deals that did not meet the standards, with the reason. Nothing here is hidden silently."
+    out["A1"].font = Font(bold=True, size=13)
+    _header(out, 3, SCREENED_COLUMNS, SCREENED_WIDTHS)
+    screened = sorted((x for x in rows if x["tier"] not in TIER_ORDER),
+                      key=lambda x: -x["risk"]["risk_adjusted_annualized"])
+    for i, x in enumerate(screened, 4):
+        risk = x["risk"]
+        values = [x["ticker"], x["company"], x["situation_type"], x["screen_reason"], x["gross_spread"],
+                  x["annualized"], risk["probability"], risk["risk_adjusted_annualized"], x["domicile"], x["sources"]]
+        for column, value in enumerate(values, 1):
+            cell = out.cell(row=i, column=column, value=value)
+            cell.alignment = Alignment(vertical="top", wrap_text=column in (4, 9))
+            if column in (5, 6, 8):
+                cell.number_format = "+0.0%;-0.0%"
+            elif column == 7:
+                cell.number_format = "0%"
+    out.auto_filter.ref = f"A3:J{max(4, 3 + len(screened))}"
+
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         workbook.save(path)
@@ -637,7 +754,9 @@ def build_deal_sheet(days: int = 270, out_dir: Path | None = None, log=print) ->
         resolve_acquirer(deal, tickers, by_name)
         deal.acquirer = deal.acquirer or counterparty_name(deal, names)
         announced = datetime.strptime(min(f.filed for f in deal.filings), "%Y-%m-%d").date()
-        deal.price, deal.undisturbed = yahoo_prices(deal.ticker, announced)
+        history = yahoo_history(deal.ticker, announced)
+        deal.price, deal.undisturbed, deal.adv_usd = history["last"], history["undisturbed"], history["adv_usd"]
+        deal.market_drift = market_drift(announced)
         if deal.ratio:
             deal.acquirer_price, _ = yahoo_prices(deal.acquirer_ticker)
         if deal.price:
@@ -654,10 +773,16 @@ def build_deal_sheet(days: int = 270, out_dir: Path | None = None, log=print) ->
             best[row["ticker"]] = row
     rows = list(best.values())
     closed = sum(1 for d in deals.values() if d.closed)
+    passing = [row for row in rows if row["tier"] in TIER_ORDER]
     notes = [
         f"Coverage: SEC EDGAR deal filings {today - timedelta(days=days)} to {today} "
-        f"({len(filings)} filings, {len(deals)} companies; {closed} already closed or delisted; {len(rows)} priced deals).",
-        "US-listed targets only (SEC filers). UK/ASX/HKEX situations are in the dashboard's global scan, not priced here.",
+        f"({len(filings)} filings, {len(deals)} companies; {closed} already closed or delisted; {len(rows)} priced deals; "
+        f"{len(passing)} meet the standards, {len(rows) - len(passing)} on Screened Out).",
+        f"Model: completion probability = base rate (merger {standards.BASE_PROBABILITY['merger']:.0%}, tender "
+        f"{standards.BASE_PROBABILITY['tender']:.0%}) moved by each condition or regulator named in the terms document; close "
+        "date = guided date plus a slip for the slowest regulator. Portfolio size assumes "
+        f"${standards.NAV_USD / 1e9:.1f}B NAV (SPECIAL_SITS_NAV_USD) and BREAK_LOSS_BUDGET {standards.BREAK_LOSS_BUDGET:.0%}.",
+        "SEC-filer targets only. UK/ASX/HKEX situations are on the dashboard's hard-catalyst list, not priced here.",
         "Not covered automatically: stubs, spin-offs, liquidations, litigation status, borrow cost. Check Sources before trading.",
     ] + warnings
     for warning in warnings:
@@ -667,9 +792,13 @@ def build_deal_sheet(days: int = 270, out_dir: Path | None = None, log=print) ->
 
     tracked = 0
     for row in rows:
-        if row["tier"] not in TIER_ORDER[:3]:
-            continue
-        deal = {**row, "date_pulled": pulled.isoformat(timespec="seconds"), "deal_terms": row["deal_terms"]}
+        # Every priced deal goes to the tracker check: new rows are added only if they clear,
+        # and a tracked deal that has fallen below is marked rather than left stale.
+        risk = row["risk"]
+        deal = {**row, "date_pulled": pulled.isoformat(timespec="seconds"), "probability": risk["probability"],
+                "break_price": risk["break_price"], "risk_adjusted_annualized": risk["risk_adjusted_annualized"],
+                # A verify-tier deal waits for the analyst to confirm its terms in the dashboard calculator.
+                "meets_standards": row["tier"] == TIER_CLEARS}
         try:
             if record_tracked_deal(deal).get("tracked"):
                 tracked += 1
@@ -677,7 +806,8 @@ def build_deal_sheet(days: int = 270, out_dir: Path | None = None, log=print) ->
             log(f"  Tracker not updated: {error}")
             break
     log(f"Deal sheet: {path}")
-    log(f"  {len(rows)} priced deals; {tracked} at or above {TRACKER_MIN_ANNUALIZED:.0%} annualized in the tracker")
+    log(f"  {len(rows)} priced deals; {len(passing)} meet the standards; {tracked} at or above "
+        f"{TRACKER_MIN_ANNUALIZED:.0%} risk-adjusted annualized in the tracker")
     return path, rows
 
 

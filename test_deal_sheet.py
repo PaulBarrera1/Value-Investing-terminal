@@ -58,7 +58,8 @@ class DealRowTests(unittest.TestCase):
     def _deal(self, **kwargs):
         deal = ds.Deal("123", "BHF", "Brighthouse Financial")
         for key, value in {"cash": 70.0, "price": 44.73, "close_date": date(2026, 12, 6),
-                           "close_basis": "guided", "undisturbed": 40.0, **kwargs}.items():
+                           "close_basis": "guided", "undisturbed": 40.0, "domicile": "United States",
+                           "exchanges": ["Nasdaq"], **kwargs}.items():
             setattr(deal, key, value)
         return deal
 
@@ -66,17 +67,36 @@ class DealRowTests(unittest.TestCase):
         row = ds.deal_row(self._deal(), date(2026, 10, 28))
         self.assertAlmostEqual(row["gross_spread"], 0.565, delta=0.001)
         self.assertEqual(row["days"], 39)
-        self.assertEqual(row["tier"], "Verify - unusually wide spread")
+        self.assertEqual(row["tier"], ds.TIER_VERIFY)   # a 56% spread means the market sees real risk
         self.assertAlmostEqual(row["downside"], 40 / 44.73 - 1)
+        self.assertEqual(row["risk"]["days_expected"], 39 + 30)   # merger slip
 
     def test_acquirer_price_is_rejected(self):
         self.assertIsNone(ds.deal_row(self._deal(price=150.0), date(2026, 10, 28)))
 
-    def test_negative_spread_goes_to_watchlist_and_missing_date_is_estimated(self):
+    def test_negative_spread_is_screened_and_missing_date_is_estimated(self):
         row = ds.deal_row(self._deal(price=72.0, close_date=None), date(2026, 10, 28))
-        self.assertEqual(row["tier"], "Watchlist - negative spread")
+        self.assertEqual(row["tier"], "Screened out")
+        self.assertIn("Negative spread", row["screen_reason"])
         self.assertTrue(row["estimated_close"])
         self.assertEqual(row["days"], ds.DEFAULT_MERGER_DAYS)
+
+    def test_tight_spread_fails_the_risk_adjusted_hurdle(self):
+        row = ds.deal_row(self._deal(price=69.0, undisturbed=50.0), date(2026, 10, 28))
+        self.assertGreater(row["annualized"], 0.10)
+        self.assertEqual(row["tier"], "Screened out")
+        self.assertTrue(row["screen_reason"].startswith("Below hurdle"))
+
+    def test_deal_off_in_the_filing_is_screened_out(self):
+        flags = ds.standards.risk_flags("Acme to Remain an Independent Public Company Following Strategic Review.")
+        row = ds.deal_row(self._deal(flags=flags), date(2026, 10, 28))
+        self.assertEqual(row["tier"], "Screened out")
+        self.assertIn("deal is off", row["screen_reason"])
+
+    def test_emerging_market_domicile_is_screened_out(self):
+        row = ds.deal_row(self._deal(domicile="Peru", exchanges=["NYSE"]), date(2026, 10, 28))
+        self.assertEqual(row["tier"], "Screened out")
+        self.assertIn("Peru is not an MSCI developed market", row["screen_reason"])
 
     def test_stock_deal_needs_acquirer_price(self):
         deal = self._deal(cash=0.0, ratio=1.5401, acquirer_ticker="INDV", acquirer_price=None, price=40.96)
@@ -93,13 +113,28 @@ class WorkbookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = ds.write_workbook([row], datetime(2026, 10, 28, 18, 0).astimezone(), Path(folder) / "x.xlsx", ["note"])
             workbook = load_workbook(path)
-        sheet, analysis = workbook.worksheets
+        sheet, analysis, screened = workbook.worksheets
         self.assertEqual(sheet.title, "Special Situations 2026-10-28")
         self.assertEqual([c.value for c in sheet[4]], ds.SHEET_COLUMNS)
-        self.assertEqual(sheet["A5"].value, "Verify - unusually wide spread (1)")
+        self.assertEqual(sheet["A5"].value, f"{ds.TIER_VERIFY} (1)")
         self.assertEqual(sheet["B6"].value, "BHF")
+        self.assertIn("Termination", sheet.cell(row=6, column=22).value)   # kill criteria
         self.assertEqual(analysis.title, "Analysis - EV Ranked")
         self.assertEqual(analysis["K5"].value, "=J5*H5+(1-J5)*I5")
+        self.assertEqual(analysis["L5"].value, "=K5*365/G5")
+        self.assertEqual(analysis["M5"].value, '=IF(L5>=0.25,"Yes","No")')
+        self.assertEqual(screened.title, "Screened Out")
+
+    def test_screened_rows_go_to_their_own_tab_with_reasons(self):
+        row = ds.deal_row(DealRowTests()._deal(domicile="Peru"), date(2026, 10, 28))
+        with tempfile.TemporaryDirectory() as folder:
+            path = ds.write_workbook([row], datetime(2026, 10, 28, 18, 0).astimezone(), Path(folder) / "x.xlsx", [])
+            workbook = load_workbook(path)
+        sheet, analysis, screened = workbook.worksheets
+        self.assertIn("No priced deal clears", sheet["A5"].value)
+        self.assertIsNone(analysis["B5"].value)
+        self.assertEqual(screened["A4"].value, "BHF")
+        self.assertIn("Outside universe", screened["D4"].value)
 
 
 if __name__ == "__main__":

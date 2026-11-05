@@ -246,12 +246,15 @@ class ScannerIntegrationTests(unittest.TestCase):
         self.assertEqual(lead["status_approvals"], "EDGAR filings: 425")
 
     def test_global_mode_survives_a_failing_feed(self):
+        import ibkr_market_scanner as scanner
+
         good = self._candidate("a", "UK Takeover Panel")
 
         def broken():
             raise RuntimeError("feed down")
 
-        with patch.object(sources, "GLOBAL_SOURCES", (
+        profiles = SimpleNamespace(get=lambda cik: {"domicile": "United States", "exchanges": ["NYSE"]})
+        with patch.object(scanner, "_sec_profiles", return_value=profiles), patch.object(sources, "GLOBAL_SOURCES", (
             lambda: ([good], ["minor"], {"sources_used": ["UK Takeover Panel"], "news_provider_names": []}),
             broken,
         )):
@@ -309,7 +312,19 @@ class TrackerTests(unittest.TestCase):
     def deal(self, annualized, **overrides):
         return {"id": "315852", "ticker": "BHF", "company": "Brighthouse Financial", "price": "44.73",
                 "consideration_value": 70, "gross_spread": 0.565, "close_date": "2026-12-06", "days": 36,
-                "annualized": annualized, "date_pulled": "2026-10-31", "deal_terms": "=70.00 cash", **overrides}
+                "annualized": annualized, "risk_adjusted_annualized": annualized, "probability": 0.9,
+                "break_price": 36.0, "date_pulled": "2026-10-31", "deal_terms": "=70.00 cash", **overrides}
+
+    def test_hurdle_uses_risk_adjusted_return_and_standards(self):
+        from ibkr_market_scanner import record_tracked_deal
+
+        gross_only = record_tracked_deal(self.deal(5.73, risk_adjusted_annualized=0.12), self.path, today="2026-10-31")
+        self.assertFalse(gross_only["tracked"])   # a wide gross spread alone does not clear
+        no_probability = record_tracked_deal(self.deal(5.73, risk_adjusted_annualized=None), self.path, today="2026-10-31")
+        self.assertFalse(no_probability["tracked"])
+        outside = record_tracked_deal(self.deal(5.73, meets_standards=False), self.path, today="2026-10-31")
+        self.assertFalse(outside["tracked"])
+        self.assertFalse(self.path.exists())
 
     def test_threshold_is_applied_in_code_and_rows_upsert_by_lead(self):
         from openpyxl import load_workbook
@@ -334,6 +349,8 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(row["Status"].value, "Active")
         self.assertEqual(row["Annualized"].value, 6.10)
         self.assertEqual(row["Annualized"].number_format, "0.0%")
+        self.assertEqual(row["Risk-adj. annualized (hurdle)"].value, 6.10)
+        self.assertEqual(row["Completion probability"].number_format, "0%")
         self.assertEqual(row["Price at pull"].value, 44.10)
         self.assertEqual(row["Deal terms"].data_type, "s")   # "=..." text is not stored as a formula
 

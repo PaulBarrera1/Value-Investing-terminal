@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -27,6 +29,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 import requests
+
+import standards
 
 
 SCAN_CODES = (
@@ -1620,9 +1624,9 @@ SPECIAL_SITUATIONS_COLUMNS = [
     ("date_pulled", "Date pulled"),
 ]
 
-# Deals whose annualized return clears this hurdle are written to the tracking workbook.
-# The dashboard only proposes; record_tracked_deal applies the threshold.
-TRACKER_MIN_ANNUALIZED = float(os.environ.get("TRACKER_MIN_ANNUALIZED", "0.25"))
+# Deals whose risk-adjusted (probability-weighted) annualized return clears this hurdle are
+# written to the tracking workbook. The dashboard only proposes; record_tracked_deal applies it.
+TRACKER_MIN_ANNUALIZED = standards.HURDLE
 TRACKER_FILENAME = "special_situations_tracker.xlsx"
 TRACKER_COLUMNS = [
     ("id", "Lead ID"),
@@ -1643,7 +1647,12 @@ TRACKER_COLUMNS = [
     ("annualized", "Annualized"),
     ("key_dates_catalyst", "Key dates/catalyst"),
     ("sources", "Sources"),
+    # Added after the first release; appended so existing tracker rows keep their columns.
+    ("probability", "Completion probability"),
+    ("break_price", "Break price"),
+    ("risk_adjusted_annualized", "Risk-adj. annualized (hurdle)"),
 ]
+TRACKER_WIDTHS = [14, 12, 12, 12, 16, 11, 30, 26, 24, 38, 12, 18, 12, 13, 12, 12, 50, 50, 12, 11, 14]
 
 ANALYSIS_COLUMNS = [
     ("rank", "EV rank"),
@@ -1770,7 +1779,8 @@ DEAL_TOOLS_SCRIPT = r"""
 const CALC_FIELDS=[['calc_cash','Cash per share (offer currency)'],['calc_ratio','Stock ratio (acquirer shares per share)'],
   ['calc_acquirer_price','Acquirer share price (offer currency)'],['calc_cvr','CVR / contingent value (analyst estimate)'],
   ['calc_fx','FX: 1 offer-currency unit in quote currency (blank = 1)'],['calc_close_date','Expected close date (days run from the pull date)'],
-  ['calc_days','Days to close (used only without a close date)']];
+  ['calc_days','Days to close (used only without a close date)'],
+  ['calc_probability','Completion probability % (your estimate)'],['calc_break_price','Break price if the deal fails (quote currency)']];
 function pullDate(row){return /^\d{4}-\d{2}-\d{2}$/.test(row.date_pulled||'')?row.date_pulled:SCAN_DATE;}
 function daysFromPull(row){
   const close=row.calc_close_date;
@@ -1793,9 +1803,19 @@ function dealMath(row){
   if(row.calc_close_date&&days<=0) return {error:'Expected close date must be after the pull date ('+pullDate(row)+').'};
   if(ratio&&!acquirer) return {error:'A stock ratio needs the acquirer share price.'};
   if(!cash&&!ratio&&!cvr) return {error:'Enter cash and/or a stock ratio with the acquirer price.'};
+  const p=calcNumber(row,'calc_probability'),breakPrice=calcNumber(row,'calc_break_price');
+  if(p!==null&&(p<0||p>100)) return {error:'Probability is a percentage from 0 to 100.'};
+  if(breakPrice!==null&&breakPrice<0) return {error:'Break price cannot be negative.'};
   const value=(cash+ratio*acquirer+cvr)*fx,spread=value/price-1;
   const parts=[cash?cash+' cash':'',ratio?ratio+' x acquirer @ '+acquirer:'',cvr?'CVR est. '+cvr:''].filter(Boolean);
-  return {value,spread,days,annualized:days>0?spread*365/days:null,
+  // Risk-adjusted = (p x spread + (1 - p) x break loss) x 365 / days: the hurdle is tested on this.
+  let riskAdj=null,loss=null,marketP=null,needed=null;
+  if(p!==null&&breakPrice!==null&&days>0){
+    loss=breakPrice/price-1;
+    riskAdj=(p/100*spread+(1-p/100)*loss)*365/days;
+    if(spread>loss){marketP=-loss/(spread-loss);needed=(TRACKER_MIN_ANNUALIZED*days/365-loss)/(spread-loss);}
+  }
+  return {value,spread,days,annualized:days>0?spread*365/days:null,p,breakPrice,loss,riskAdj,marketP,needed,
     terms:parts.join(' + ')+(fx!==1?' (x FX '+fx+')':'')};
 }
 function renderDealTools(id){
@@ -1804,8 +1824,9 @@ function renderDealTools(id){
   host.innerHTML='<h3 style="margin-top:22px">Deal calculator</h3>'+
     '<p class="sheet-note">Enter the offer terms from the source filing. Consideration value = (cash + ratio x acquirer price + CVR estimate) x FX; '+
     'annualized = gross spread x 365 / days (simple, as in the workbook), with days counted from the pull date ('+escapeCell(pullDate(row))+'). '+
-    'CVR value is your estimate, not a market price. Applying a deal at or above '+(TRACKER_MIN_ANNUALIZED*100).toFixed(0)+
-    '% annualized adds it to the tracking workbook.</p>'+
+    'The hurdle is risk-adjusted: (p x spread + (1 - p) x break loss) x 365 / days must reach '+(TRACKER_MIN_ANNUALIZED*100).toFixed(0)+
+    '%. Use a close date that allows for regulatory slippage and a break price below the pre-deal price (deals break on bad news). '+
+    'CVR value is your estimate, not a market price. Applying a deal that clears adds it to the tracking workbook.</p>'+
     '<div class="detail-grid">'+CALC_FIELDS.map(([field,label])=>'<label class="detail-field"><span>'+escapeCell(label)+
       '</span><input type="'+(field==='calc_close_date'?'date" min="'+pullDate(row):'number" step="any')+'" data-calc="'+field+
       '" value="'+escapeCell(row[field]??'')+'"></label>').join('')+'</div>'+
@@ -1822,7 +1843,16 @@ function updateCalcResult(id){
   const r=dealMath(row);
   out.textContent=r.error||('Consideration '+r.value.toFixed(2)+' vs price '+Number(row.price).toFixed(2)+
     ' -> gross spread '+signedPct(r.spread)+(r.annualized!==null?', annualized '+signedPct(r.annualized)+' over '+r.days+
-    'd from '+pullDate(row)+(r.annualized>=TRACKER_MIN_ANNUALIZED?' - clears the tracking threshold':''):', add a close date for annualized'));
+    'd from '+pullDate(row):', add a close date for annualized')+riskText(r));
+}
+function riskText(r){
+  if(r.riskAdj===null) return '. Add a probability and break price to test the '+(TRACKER_MIN_ANNUALIZED*100).toFixed(0)+'% risk-adjusted hurdle.';
+  const pct=x=>(x*100).toFixed(0)+'%';
+  return '. Break loss '+signedPct(r.loss)+'; risk-adjusted annualized '+signedPct(r.riskAdj)+
+    (r.riskAdj>=TRACKER_MIN_ANNUALIZED?' - clears the hurdle':' - below the hurdle')+
+    (r.marketP!==null?'. Market-implied p '+pct(r.marketP)+' vs your '+r.p+'%'+(r.p/100-r.marketP>0.15?
+      ' - you are far more confident than the market: find what it is pricing':''):'')+
+    (r.needed!==null?(r.needed>1?'. Cannot clear even at 100%':'. Needs p >= '+pct(Math.max(0,r.needed))):'')+'.';
 }
 function renderFinancials(f){
   const table=document.getElementById('finTable');
@@ -1862,6 +1892,7 @@ document.getElementById('selectedAnalysis').addEventListener('click',async event
     if(!research.deal_terms) research.deal_terms=r.terms;
     if(analysis){
       analysis.upside=(r.spread*100).toFixed(1);
+      if(r.riskAdj!==null){analysis.probability=String(r.p);analysis.downside=(r.loss*100).toFixed(1);}
       if(r.days>0) analysis.days=String(r.days);
       analysis.annualized=research.annualized;
       if(!analysis.value_estimate) analysis.value_estimate=r.value.toFixed(2)+' ('+r.terms+')';
@@ -1870,11 +1901,13 @@ document.getElementById('selectedAnalysis').addEventListener('click',async event
     const result=document.getElementById('calcResult');
     result.textContent='Applied to the workbook row and the EV analysis upside.';
     if(r.annualized===null){result.textContent+=' Add an expected close date to check it against the tracking threshold.';return;}
+    if(r.riskAdj===null){result.textContent+=' Add a probability and break price to test it against the risk-adjusted hurdle; tracker not updated.';return;}
     try{
       const response=await fetch('/api/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
         id,ticker:research.ticker,company:research.company,situation_type:research.situation_type,counterparty:research.counterparty,
         deal_terms:research.deal_terms,price:research.price,consideration_value:r.value,gross_spread:r.spread,
         close_date:research.calc_close_date||'',days:r.days,annualized:r.annualized,
+        probability:r.p/100,break_price:r.breakPrice,risk_adjusted_annualized:r.riskAdj,
         key_dates_catalyst:research.key_dates_catalyst,sources:research.sources,date_pulled:pullDate(research)})});
       const tracked=await response.json();
       if(!response.ok) throw new Error(tracked.error||'Tracker update failed.');
@@ -1963,7 +1996,7 @@ def build_live_report(
         for mode, label in SOURCE_MODES.items()
     )
     controls = f"""
-<p class="pulled-date">Data pulled: <strong>{_safe(pulled_at.strftime("%a %b %d, %Y %H:%M %Z").strip())}</strong> · days to close and annualized returns run from this date · deals at or above {TRACKER_MIN_ANNUALIZED:.0%} annualized are added to <code>{_safe(TRACKER_FILENAME)}</code></p>
+<p class="pulled-date">Data pulled: <strong>{_safe(pulled_at.strftime("%a %b %d, %Y %H:%M %Z").strip())}</strong> · days to close and annualized returns run from this date · deals at or above {TRACKER_MIN_ANNUALIZED:.0%} risk-adjusted annualized are added to <code>{_safe(TRACKER_FILENAME)}</code></p>
 <div class="actions">
   <label for="sourceMode">Scan sources</label>
   <select id="sourceMode" aria-label="Scan sources">{source_options}</select>
@@ -2634,6 +2667,16 @@ def build_excel_report(
         if price_cell.value is not None:
             price_cell.number_format = "0.00"
 
+    screened = summary.get("screened_out") or []
+    if screened:
+        _write_sheet(
+            workbook.create_sheet("Screened Out"),
+            ["Ticker", "Company", "Reason screened out", "First headline", "Source", "Link"],
+            [[row["ticker"], row["company"], row["reason"], row["headline"], row["source"], row.get("url", "")]
+             for row in screened],
+            [14, 32, 60, 70, 26, 50],
+        )
+
     workbook.save(path)
 
 
@@ -2642,19 +2685,21 @@ def tracker_path() -> Path:
 
 
 def record_tracked_deal(deal: dict, path=None, today: str = "") -> dict:
-    """Add or update a deal in the tracking workbook when its annualized return clears the hurdle.
+    """Add or update a deal in the tracking workbook when its risk-adjusted annualized return
+    (probability-weighted, see standards.py) clears the hurdle.
 
-    One row per lead ID. A deal already tracked that falls below the hurdle stays in the workbook
-    with status "Below threshold"; a new deal below the hurdle is not added. The threshold is
-    applied here, not by the dashboard.
+    One row per lead ID. A deal already tracked that falls below the hurdle, or no longer meets
+    the standards (meets_standards False), stays in the workbook with status "Below threshold";
+    a new deal below the hurdle is not added. The threshold is applied here, not by the dashboard.
     """
     path = Path(path or tracker_path())
     today = today or datetime.now().astimezone().date().isoformat()
     lead_id = str(deal.get("id", "")).strip()
     if not lead_id:
         raise ValueError("Tracked deal needs a lead ID.")
-    annualized = _optional_number(deal.get("annualized"))
-    clears = annualized is not None and annualized >= TRACKER_MIN_ANNUALIZED
+    risk_adjusted = _optional_number(deal.get("risk_adjusted_annualized"))
+    clears = (risk_adjusted is not None and risk_adjusted >= TRACKER_MIN_ANNUALIZED
+              and deal.get("meets_standards", True) is not False)
 
     if path.exists():
         workbook = load_workbook(path)
@@ -2665,8 +2710,7 @@ def record_tracked_deal(deal: dict, path=None, today: str = "") -> dict:
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Tracker"
-        _write_sheet(sheet, [label for _, label in TRACKER_COLUMNS], [],
-                     [14, 12, 12, 12, 16, 11, 30, 26, 24, 38, 12, 18, 12, 13, 12, 12, 50, 50])
+        _write_sheet(sheet, [label for _, label in TRACKER_COLUMNS], [], TRACKER_WIDTHS)
 
     existing_row = next(
         (row[0].row for row in sheet.iter_rows(min_row=2, max_col=1) if str(row[0].value) == lead_id),
@@ -2675,7 +2719,12 @@ def record_tracked_deal(deal: dict, path=None, today: str = "") -> dict:
     if existing_row is None and not clears:
         return {"tracked": False, "status": "Below threshold", "path": str(path)}
 
-    numbers = {"price", "consideration_value", "gross_spread", "days", "annualized"}
+    for column, (_, label) in enumerate(TRACKER_COLUMNS, 1):   # trackers made before the new columns
+        if sheet.cell(row=1, column=column).value != label:
+            sheet.cell(row=1, column=column, value=label).font = copy(sheet.cell(row=1, column=1).font)
+            sheet.column_dimensions[sheet.cell(row=1, column=column).column_letter].width = TRACKER_WIDTHS[column - 1]
+    numbers = {"price", "consideration_value", "gross_spread", "days", "annualized", "probability",
+               "break_price", "risk_adjusted_annualized"}
     values = {key: (_optional_number(deal.get(key)) if key in numbers else str(deal.get(key, ""))[:4000])
               for key, _ in TRACKER_COLUMNS}
     values.update({
@@ -2692,9 +2741,11 @@ def record_tracked_deal(deal: dict, path=None, today: str = "") -> dict:
         cell = sheet.cell(row=row_number, column=column, value=values[key])
         if isinstance(values[key], str):
             cell.data_type = "s"   # keep text like "=..." from becoming a formula
-        if key in ("gross_spread", "annualized") and values[key] is not None:
+        if key in ("gross_spread", "annualized", "risk_adjusted_annualized") and values[key] is not None:
             cell.number_format = "0.0%"
-        elif key in ("price", "consideration_value") and values[key] is not None:
+        elif key == "probability" and values[key] is not None:
+            cell.number_format = "0%"
+        elif key in ("price", "consideration_value", "break_price") and values[key] is not None:
             cell.number_format = "0.00"
     sheet.auto_filter.ref = sheet.dimensions
     try:
@@ -2757,6 +2808,75 @@ def merge_duplicate_candidates(candidates: list[ScanCandidate]) -> list[ScanCand
         if existing.price is None and candidate.price is not None:
             existing.price, existing.quote_time = candidate.price, candidate.quote_time
     return list(merged.values())
+
+
+_SEC_PROFILES: standards.SecProfiles | None = None
+
+
+def _sec_profiles() -> standards.SecProfiles:
+    global _SEC_PROFILES
+    if _SEC_PROFILES is None:
+        _SEC_PROFILES = standards.SecProfiles(os.environ.get(
+            "SEC_USER_AGENT", "Value-Investing-Terminal research scanner (set SEC_USER_AGENT with contact details)"))
+    return _SEC_PROFILES
+
+
+def _candidate_market(candidate: ScanCandidate) -> tuple[bool, str]:
+    """MSCI developed-market test: SEC domicile for filers, the ISIN or listing suffix otherwise."""
+    contract = candidate.contract
+    symbol = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", ""))
+    if getattr(contract, "secType", "") == "FILING":
+        cik = candidate.research.get("cik") or str(getattr(contract, "conId", ""))
+        return standards.sec_market_status(_sec_profiles().get(cik))
+    if getattr(contract, "exchange", "") == "UK Takeover Panel":
+        domicile = standards.listing_country(symbol) if standards.ISIN_RE.match(symbol.upper()) else ""
+        return standards.market_status(domicile, "United Kingdom")
+    return standards.market_status("", standards.listing_country(symbol))
+
+
+def apply_standards(candidates: list[ScanCandidate]) -> tuple[list[ScanCandidate], list[dict]]:
+    """Keep event leads that are primary-source hard catalysts in MSCI developed markets.
+
+    Returns the kept candidates and one row per screened-out lead with its reason, so nothing is
+    dropped silently. Scanner contracts with no event headline are left alone.
+    """
+    kept, screened = [], []
+    for candidate in candidates:
+        if not candidate.headlines:
+            kept.append(candidate)
+            continue
+        kind, reason = standards.screen_candidate(candidate)
+        if kind:
+            in_universe, basis = _candidate_market(candidate)
+            if in_universe:
+                candidate.research.setdefault("situation_type", kind)
+                candidate.research.update({
+                    "tier": f"Hard catalyst · {kind}",
+                    "risks": (f"{basis}. Price it in the deal calculator (terms, probability, break price): it counts "
+                              f"against the {standards.HURDLE:.0%} risk-adjusted hurdle only then."),
+                })
+                kept.append(candidate)
+                continue
+            reason = f"Outside universe: {basis}"
+        first = candidate.headlines[0]
+        contract = candidate.contract
+        screened.append({
+            "ticker": str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "")),
+            "company": candidate.description,
+            "reason": reason,
+            "headline": first.get("headline", ""),
+            "source": first.get("provider", ""),
+            "url": first.get("url", ""),
+        })
+    return kept, screened
+
+
+def _standards_warning(kept: int, screened: list[dict]) -> str:
+    reasons = Counter(row["reason"].split(":")[0] for row in screened).most_common(4)
+    return (f"Standards kept {kept} of {kept + len(screened)} event leads (primary-source hard catalysts in MSCI "
+            f"developed markets). Screened out {len(screened)}, mainly: "
+            + "; ".join(f"{reason} ({count})" for reason, count in reasons)
+            + ". Each one and its reason is on the Screened Out tab of the exported workbook.")
 
 
 def _scan_selected_sources(source_mode: str) -> tuple[list[ScanCandidate], list[str], dict]:
@@ -2844,6 +2964,10 @@ def _scan_selected_sources(source_mode: str) -> tuple[list[ScanCandidate], list[
         summary["news_provider_names"].extend(vendor_providers)
 
     candidates = merge_duplicate_candidates(candidates)
+    candidates, screened = apply_standards(candidates)
+    summary["screened_out"] = screened
+    if screened:
+        warnings.insert(0, _standards_warning(sum(1 for c in candidates if c.headlines), screened))
     summary["pulled_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     summary["sources_used"] = list(dict.fromkeys(summary["sources_used"]))
     summary["news_provider_names"] = list(dict.fromkeys(summary["news_provider_names"]))
